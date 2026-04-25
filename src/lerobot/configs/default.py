@@ -114,3 +114,8 @@ class PeftConfig:
     # the rank used for the adapter. In general a higher rank means more trainable parameters and closer to full
     # fine-tuning.
     r: int = 16
+
+    
+    lora_alpha: int = 8
+
+    lora_dropout: float = 0.00

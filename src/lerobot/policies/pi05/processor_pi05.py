@@ -56,6 +56,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     """
 
     max_state_dim: int = 32
+    hierarchical: bool = False
     task_key: str = "task"
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -64,7 +65,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for PI05")
-        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
+        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key if not self.hierarchical else "subtask")
         if tasks is None:
             raise ValueError("No task found in complementary data")
 
@@ -147,7 +148,9 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            hierarchical=config.hierarchical),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,

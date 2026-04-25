@@ -207,6 +207,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         # Tokenize subtask if available
         subtask = self.get_subtask(self.transition)
         if subtask is not None:
+            subtask = [s + self.input_tokenizer.eos_token for s in subtask]
             tokenized_subtask = self._tokenize_text(subtask)
 
             # Move new tokenized tensors to the detected device

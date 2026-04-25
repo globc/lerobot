@@ -61,6 +61,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        dynamic_action_chunking: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -209,6 +210,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
 
+        self.dynamic_action_chunking = dynamic_action_chunking
+
         # Load metadata (sets self.root once from the resolved metadata root)
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self._requested_root, self.revision, force_cache_sync=force_cache_sync
@@ -225,6 +228,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             video_backend=self._video_backend,
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
+            dynamic_action_chunking=dynamic_action_chunking,
         )
 
         # Load actual data
@@ -288,6 +292,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 video_backend=self._video_backend,
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
+                dynamic_action_chunking=self.dynamic_action_chunking,
             )
         return self.reader
 

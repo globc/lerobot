@@ -93,6 +93,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
+                dynamic_action_chunking=cfg.policy.dynamic_action_chunking,
             )
         else:
             dataset = StreamingLeRobotDataset(

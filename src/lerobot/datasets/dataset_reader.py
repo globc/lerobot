@@ -32,6 +32,7 @@ from .io_utils import (
     load_nested_dataset,
 )
 from .video_utils import decode_video_frames
+import numpy as np
 
 
 class DatasetReader:
@@ -49,6 +50,7 @@ class DatasetReader:
         video_backend: str,
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
+        dynamic_action_chunking: bool = False,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -73,7 +75,7 @@ class DatasetReader:
         self._tolerance_s = tolerance_s
         self._video_backend = video_backend
         self._image_transforms = image_transforms
-
+        self.dynamic_action_chunking = dynamic_action_chunking
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
 
@@ -181,6 +183,22 @@ class DatasetReader:
         ep = self._meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
+
+        ### Dynamic action chunking ###
+        if self.dynamic_action_chunking:
+            rel_idx = self._absolute_to_relative_idx[abs_idx] if self._absolute_to_relative_idx is not None else abs_idx
+            rel_ep_end = self._absolute_to_relative_idx[ep_end] if self._absolute_to_relative_idx is not None else ep_end
+
+            sub_idx = int(self.hf_dataset[rel_idx]['subtask_index'])
+            ep_sub_indices = np.array([int(self.hf_dataset[idx]['subtask_index']) for idx in range(rel_idx, rel_ep_end)])
+            
+            # Count until next subtask, reoccuring later doesn't count
+            mismatches = ep_sub_indices != sub_idx
+            sub_len = np.argmax(mismatches) if np.any(mismatches) else len(ep_sub_indices)
+            sub_end = abs_idx + sub_len
+            
+            ep_end = sub_end
+
         query_indices = {
             key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()
@@ -264,6 +282,14 @@ class DatasetReader:
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+
+            if self.dynamic_action_chunking and "action" in item and "action_is_pad" in item:
+                is_pad = item["action_is_pad"]
+                if is_pad.any():
+                    noops = torch.zeros_like(item["action"])
+                    noops[..., -1] = item["action"][..., -1]
+                    
+                    item["action"] = torch.where(is_pad.unsqueeze(-1), noops, item["action"])
 
         if len(self._meta.video_keys) > 0:
             current_ts = item["timestamp"].item()

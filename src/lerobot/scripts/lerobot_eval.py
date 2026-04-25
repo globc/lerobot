@@ -50,10 +50,13 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 """
 
 import concurrent.futures as cf
+from itertools import cycle
 import json
 import logging
 import threading
 import time
+import textwrap
+import cv2
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -81,6 +84,7 @@ from lerobot.envs import (
     make_env_pre_post_processors,
     preprocess_observation,
 )
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
@@ -102,9 +106,12 @@ def rollout(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    planner: PreTrainedPolicy | None,
+    planner_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
+    planner_postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None,
     seeds: list[int] | None = None,
     return_observations: bool = False,
-    render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    render_callback: Callable[[gym.vector.VectorEnv, Any], None] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -141,9 +148,10 @@ def rollout(
 
     # Reset the policy and environments.
     policy.reset()
+    current_task = [""] * env.num_envs
     observation, info = env.reset(seed=seeds)
     if render_callback is not None:
-        render_callback(env)
+        render_callback(env, current_task)
 
     all_observations = []
     all_actions = []
@@ -180,6 +188,36 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+        
+        if len(policy._action_queue) == 0:
+            if planner is not None:
+                observation_planner = planner_preprocessor(observation)
+                with torch.inference_mode():
+                    subtask = planner.select_action(observation_planner)
+                
+                    subtask = planner_postprocessor(subtask)
+                current_task = subtask
+                logging.info(f"Planner selected task: {current_task}")
+            elif getattr(policy.config, "hierarchical", False):
+                import matplotlib.pyplot as plt
+                from pathlib import Path
+                
+                img = observation['observation.images.image'][0]
+                if isinstance(img, torch.Tensor):
+                    img = img.detach().cpu().numpy()
+                
+                # Convert (C, H, W) to (H, W, C)
+                if img.ndim == 3 and img.shape[0] in (1, 3):
+                    img = np.transpose(img, (1, 2, 0))
+                
+                plt.imsave("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/lerobot/current_observation.png", img)
+                
+                user_subtask = input(f"\nEnter subtask for task '{observation['task'][0]}': ")
+                current_task = [user_subtask] * env.num_envs
+            else:
+                current_task = observation["task"]
+            
+        observation["subtask"] = current_task
 
         observation = preprocessor(observation)
         with torch.inference_mode():
@@ -197,7 +235,7 @@ def rollout(
         # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
-            render_callback(env)
+            render_callback(env, current_task)
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available if none of the envs finished.
@@ -268,6 +306,9 @@ def eval_policy(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    planner: PreTrainedPolicy | None,
+    planner_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
+    planner_postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None,
     n_episodes: int,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
@@ -319,17 +360,49 @@ def eval_policy(
     n_episodes_rendered = 0  # for saving the correct number of videos
 
     # Callback for visualization.
-    def render_frame(env: gym.vector.VectorEnv):
+    def render_frame(env: gym.vector.VectorEnv, tasks: list[str] | None = None):
         # noqa: B023
         if n_episodes_rendered >= max_episodes_rendered:
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+        
+        if tasks is None:
+            tasks = [""] * n_to_render_now
+        elif isinstance(tasks, str):
+            tasks = [tasks] * n_to_render_now
+
+        raw_frames = []
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            raw_frames = [env.envs[i].render() for i in range(n_to_render_now)]
         elif hasattr(env, "call"):
             # Here we must render all frames and discard any we don't need.
             # Covers AsyncVectorEnv and _LazyAsyncVectorEnv (which wraps one).
-            ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+            raw_frames = env.call("render")[:n_to_render_now]
+
+        annotated_frames = []
+        for i, frame in enumerate(raw_frames):
+            frame = np.ascontiguousarray(frame)
+            task_str = str(tasks[i]) if i < len(tasks) else ""
+            
+            if task_str:
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.4
+                thickness = 1
+                # Wrap text to ~35 characters to fit within a 256px wide frame nicely
+                wrapped_text = textwrap.wrap(task_str, width=35)
+                
+                y0, dy = 15, 15
+                for j, line in enumerate(wrapped_text):
+                    y = y0 + j * dy
+                    # Draw text outline for better contrast over arbitrary backgrounds
+                    cv2.putText(frame, line, (5, y), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+                    # Draw internal white text
+                    cv2.putText(frame, line, (5, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            
+            annotated_frames.append(frame)
+
+        if annotated_frames:
+            ep_frames.append(np.stack(annotated_frames))  # noqa: B023
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
@@ -358,6 +431,9 @@ def eval_policy(
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
+            planner=planner,
+            planner_preprocessor=planner_preprocessor,
+            planner_postprocessor=planner_postprocessor,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
@@ -530,21 +606,51 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
-    logging.info(f"Making environment (batch_size={cfg.eval.batch_size}, async={cfg.eval.use_async_envs}).")
-    envs = make_env(
-        cfg.env,
-        n_envs=cfg.eval.batch_size,
-        use_async_envs=cfg.eval.use_async_envs,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+    if cfg.repo_id is None:
+        logging.info("Making environment.")
+        envs = make_env(
+            cfg.env,
+            n_envs=cfg.eval.batch_size,
+            use_async_envs=cfg.eval.use_async_envs,
+            trust_remote_code=cfg.trust_remote_code,
+        )
 
-    logging.info("Making policy.")
+        logging.info("Making policy.")
 
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
-    )
+        policy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+            rename_map=cfg.rename_map,
+        )
+
+        if cfg.planner is not None:
+            logging.info("Making planner.")
+
+            planner = make_policy(
+                cfg=cfg.planner,
+                env_cfg=cfg.env,
+                rename_map=cfg.rename_map,
+            )
+            planner.eval()
+
+    else:
+        dataset = LeRobotDataset(cfg.repo_id)
+
+        policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+            rename_map=cfg.rename_map,
+        )
+
+        if cfg.planner is not None:
+            logging.info("Making planner.")
+
+            planner = make_policy(
+                cfg=cfg.planner,
+                ds_meta=dataset.meta,
+                rename_map=cfg.rename_map,
+            )
+            planner.eval()
 
     policy.eval()
 
@@ -553,6 +659,10 @@ def eval_main(cfg: EvalPipelineConfig):
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+    if cfg.policy.type == "pi05":
+        preprocessor_overrides["pi05_prepare_state_tokenizer_processor_step"] = {
+            "hierarchical": policy.config.hierarchical
+        }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -560,32 +670,60 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
 
-    # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
-
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        info = eval_policy_all(
-            envs=envs,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
-            videos_dir=Path(cfg.output_dir) / "videos",
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
+    if cfg.planner is not None:
+        preprocessor_overrides = {
+            "device_processor": {"device": str(policy.config.device)},
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        planner_preprocessor, planner_postprocessor = make_pre_post_processors(
+            policy_cfg=cfg.planner,
+            pretrained_path=cfg.planner.pretrained_path,
+            preprocessor_overrides=preprocessor_overrides,
         )
-        print("Overall Aggregated Metrics:")
-        print(info["overall"])
 
-        # Print per-suite stats
-        for task_group, task_group_info in info.items():
-            print(f"\nAggregated Metrics for {task_group}:")
-            print(task_group_info)
-    # Close all vec envs
-    close_envs(envs)
+    if cfg.repo_id is not None:
+        with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+            info = eval_policy_dataset(
+                dataset=dataset,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                planner=planner if cfg.planner is not None else None,
+                planner_preprocessor=planner_preprocessor if cfg.planner is not None else None,
+                planner_postprocessor=planner_postprocessor if cfg.planner is not None else None,
+                batch_size=cfg.eval.batch_size,
+            )
+    else:
+        # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
+        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+
+        with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+            info = eval_policy_all(
+                envs=envs,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                n_episodes=cfg.eval.n_episodes,
+                planner=planner if cfg.planner is not None else None,
+                planner_preprocessor=planner_preprocessor if cfg.planner is not None else None,
+                planner_postprocessor=planner_postprocessor if cfg.planner is not None else None,
+                max_episodes_rendered=10,
+                videos_dir=Path(cfg.output_dir) / "videos",
+                start_seed=cfg.seed,
+                max_parallel_tasks=cfg.env.max_parallel_tasks,
+            )
+        # Close all vec envs
+        close_envs(envs)
+
+    print("Overall Aggregated Metrics:")
+    print(info["overall"])
+
+    # Print per-suite stats
+    for task_group, task_group_info in info.items():
+        print(f"\nAggregated Metrics for {task_group}:")
+        print(task_group_info)
 
     # Save info
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
@@ -613,6 +751,9 @@ def eval_one(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    planner: PreTrainedPolicy | None,
+    planner_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
+    planner_postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None,
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
@@ -630,6 +771,9 @@ def eval_one(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        planner=planner,
+        planner_preprocessor=planner_preprocessor,
+        planner_postprocessor=planner_postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
@@ -656,6 +800,9 @@ def run_one(
     env_postprocessor,
     preprocessor,
     postprocessor,
+    planner,
+    planner_preprocessor,
+    planner_postprocessor,
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
@@ -680,6 +827,9 @@ def run_one(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        planner=planner,
+        planner_preprocessor=planner_preprocessor,
+        planner_postprocessor=planner_postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
@@ -700,6 +850,9 @@ def eval_policy_all(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    planner=None,
+    planner_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
+    planner_postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
     *,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
@@ -756,6 +909,9 @@ def eval_policy_all(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        planner=planner,
+        planner_preprocessor=planner_preprocessor,
+        planner_postprocessor=planner_postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
@@ -832,6 +988,206 @@ def eval_policy_all(
         "per_group": groups_aggregated,
         "overall": overall_agg,
     }
+
+def eval_policy_dataset(
+    dataset: LeRobotDataset,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    planner: PreTrainedPolicy | None,
+    planner_preprocessor: PolicyProcessorPipeline | None,
+    planner_postprocessor: PolicyProcessorPipeline | None,
+    batch_size: int,
+    num_samples: int = 10000,
+) -> dict:
+    start_t = time.time()
+    policy.eval()
+    policy.reset()
+    
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    dl_iter = cycle(dataloader)
+
+    group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {"sum_rewards": [], "max_rewards": [], "successes": []})
+    overall: dict[str, list] = {"sum_rewards": [], "max_rewards": [], "successes": []}
+    per_task_infos: list[dict] = []
+    
+    if planner is not None:
+        planner.eval()
+
+        for _ in range(num_samples):
+            batch = next(dl_iter)
+            
+            batch_planner = planner_preprocessor(batch)
+            pred_subtask = planner.select_action(batch_planner)
+
+            print(f"Task: {batch['task'][0]}\nGT Subtask: {batch['subtask'][0]}\nPred Subtask: {pred_subtask[0]}\n\n")
+
+            batch["subtask"] = pred_subtask
+            gt_actions = batch["action"]
+            batch = preprocessor(batch)
+            
+            print(f"Number action steps: {policy.config.n_action_steps}")
+            pred_actions = []
+            for _ in range(policy.config.n_action_steps):
+                pred_action = policy.select_action(batch)
+                pred_action = postprocessor(pred_action)
+                pred_actions.append(pred_action)
+
+            print(f"Task: {batch['task'][0]}\nGT Actions: {gt_actions}\nPred Actions: {pred_actions}\n")
+
+    elif policy.name == "pi0_fast":
+        sample_ix = 0
+        
+        while sample_ix < num_samples:
+            batch = next(dl_iter)
+            
+            original_tasks = batch["task"].copy()
+
+            batch = preprocessor(batch)
+            
+            gt_subtasks = batch["subtask"] if "subtask" in batch else [""] * len(batch["task"])
+            pred_subtasks = policy.select_action(batch)
+
+            for b in range(batch_size):
+                if sample_ix >= num_samples:
+                    break
+                task_group = original_tasks[b]
+                gt_subtask = gt_subtasks[b]
+                pred_subtask = pred_subtasks[b]
+                
+                # Calculate success for this specific sample
+                is_success = bool(pred_subtask == gt_subtask)
+                sum_reward = 1.0 if is_success else 0.0
+                max_reward = 1.0 if is_success else 0.0
+                
+                # Accumulate per group and overall
+                group_acc[task_group]["successes"].append(is_success)
+                group_acc[task_group]["sum_rewards"].append(sum_reward)
+                group_acc[task_group]["max_rewards"].append(max_reward)
+                
+                overall["successes"].append(is_success)
+                overall["sum_rewards"].append(sum_reward)
+                overall["max_rewards"].append(max_reward)
+                
+                # Accumulate per episode/sample
+                per_task_infos.append({
+                    "sample_ix": sample_ix,
+                    "task_group": task_group,
+                    "gt_subtask": gt_subtask,
+                    "pred_subtask": pred_subtask,
+                    "success": is_success,
+                    "sum_reward": sum_reward,
+                    "max_reward": max_reward,
+                })
+
+                logging.info(f"Sample {sample_ix+1}/{num_samples}")
+                logging.info(f"Original Task: {task_group}")
+                logging.info(f"GT Subtask:   {gt_subtask}")
+                logging.info(f"Pred Subtask: {pred_subtask}")
+                logging.info(f"Match: {is_success}")
+                logging.info("-" * 40)
+
+                sample_ix += 1
+            
+        def _agg_from_list(xs):
+            if not xs: return float("nan")
+            return float(np.nanmean(np.array(xs, dtype=float)))
+
+        # Compute per-group aggregates
+        groups_aggregated = {}
+        for group, acc in group_acc.items():
+            groups_aggregated[group] = {
+                "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
+                "avg_max_reward": _agg_from_list(acc["max_rewards"]),
+                "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
+                "n_episodes": len(acc["sum_rewards"]),
+            }
+
+        # Overall aggregates
+        overall_agg = {
+            "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
+            "avg_max_reward": _agg_from_list(overall["max_rewards"]),
+            "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
+            "n_episodes": len(overall["sum_rewards"]),
+            "eval_s": time.time() - start_t,
+            "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
+        }
+        
+        logging.info(f"Subtask Prediction Accuracy: {overall_agg['pc_success']:.2f}%")
+        
+        return {
+            "per_task": per_task_infos,
+            "per_group": groups_aggregated,
+            "overall": overall_agg,
+        }
+
+    # elif policy.name == "pi0_fast":
+    #     is_generalize = False
+    #     task_to_target_object = {
+    #         "pick up the sweet object and put it in the tray": {"OR": ["pudding"]},
+    #         "pick up the tallest object and put it in the tray": {"OR": ["ketchup", "bottle"], "NOT": ["alphabet"]},
+    #         "pick up the mug next to the book and place it to the right compartment of the caddy": {"AND": ["white", "mug"]}
+    #     }
+    #     results = {task: [] for task in task_to_target_object.keys()}
+    #     for _ in range(num_samples):
+    #         batch = next(dl_iter)
+            
+    #         targets = [task_to_target_object[t] for t in batch["task"]]
+    #         original_task = batch["task"].copy()
+
+    #         batch = preprocessor(batch)
+            
+    #         gt_subtask = batch["subtask"][0]
+            
+    #         # observation = preprocessor(observation)
+    #         pred_subtask = policy.select_action(batch)[0]
+
+    #         score = 0
+    #         for target in targets:
+    #             if "OR" in target:
+    #                 if any(t in pred_subtask for t in target["OR"]):
+    #                     score = 1   
+    #             if "AND" in target:
+    #                 if all(t in pred_subtask for t in target["AND"]):
+    #                     score = 1
+    #             if "NOT" in target:
+    #                 if any(t in pred_subtask for t in target["NOT"]):
+    #                     score = 0
+
+    #         results[original_task[0]].append(score)
+    #         print(f"Task: {original_task[0]}\nGT Subtask: {gt_subtask}\nPred Subtask: {pred_subtask}\n\n")
+            
+    #         policy.reset()
+
+    #     for task, scores in results.items():
+    #         success_rate = sum(scores) / len(scores) * 100
+    #         print(f"Task: {task}\nSuccess Rate: {success_rate:.2f}%\n")
+    # elif policy.name == "pi0":
+    #     task_to_orig = {
+    #         "pick up the sweet object and put it in the tray": "pick up the chocalate pudding and put it in the tray",
+    #         "pick up the tallest object and put it in the tray": "pick up the ketchup and put it in the tray",
+    #         "pick up the mug next to the book and place it to the right compartment of the caddy": "pick up the white mug and place it to the right compartment of the caddy"
+    #     }
+    #     for _ in range(num_samples):
+    #         batch = next(dl_iter)
+    #         gt_actions = batch["action"]
+    #         # batch["task"] = [task_to_orig[t] for t in batch["task"]]
+    #         batch = preprocessor(batch)
+    #         # batch["task"] = batch["subtask"]
+            
+    #         print(f"Number action steps: {policy.config.n_action_steps}")
+    #         pred_actions = []
+    #         for _ in range(policy.config.n_action_steps):
+    #             pred_action = policy.select_action(batch)
+    #             pred_action = postprocessor(pred_action)
+    #             pred_actions.append(pred_action)
+
+    #         print(f"Task: {batch['task'][0]}\nGT Actions: {gt_actions}\nPred Actions: {pred_actions}\n")
+
 
 
 def main():

@@ -50,6 +50,8 @@ class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
     which expects a newline at the end of the text prompt. It handles both single
     strings and lists of strings for the 'task' key in complementary data.
     """
+    def __init__(self, hierarchical: bool = False):
+        self.hierarchical = hierarchical
 
     def complementary_data(self, complementary_data):
         """
@@ -62,12 +64,20 @@ class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
         Returns:
             A new dictionary with the modified 'task' field.
         """
-        if "task" not in complementary_data:
-            return complementary_data
+        if self.hierarchical:
+            if "subtask" not in complementary_data:
+                raise ValueError("No subtask found in complementary data")
 
-        task = complementary_data["task"]
-        if task is None:
-            return complementary_data
+            task = complementary_data["subtask"]
+            if task is None:
+                raise ValueError("Subtask is required")
+        else:
+            if "task" not in complementary_data:
+                return complementary_data
+
+            task = complementary_data["task"]
+            if task is None:
+                return complementary_data
 
         new_complementary_data = dict(complementary_data)
 
@@ -140,7 +150,7 @@ def make_pi0_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        Pi0NewLineProcessor(),  # Add newlines before tokenization for PaliGemma
+        Pi0NewLineProcessor(hierarchical=config.hierarchical),  # Add newlines before tokenization for PaliGemma
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,

@@ -35,6 +35,7 @@ class PI0Config(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
+    hierarchical: bool = False
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32

@@ -29,16 +29,13 @@ DEFAULT_IMAGE_SIZE = 224
 @dataclass
 class PI0FastConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
-    action_expert_variant: str = "gemma_300m"
-    dtype: str = "float32"  # Options: "bfloat16", "float32"
-
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    dtype: str = "float32"
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
-    max_action_tokens: int = 256
+    max_action_tokens: int = 32
+    hierarchical: bool = True
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
@@ -62,12 +59,7 @@ class PI0FastConfig(PreTrainedConfig):
     text_tokenizer_name: str = "google/paligemma-3b-pt-224"
     action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
     temperature: float = 0.0
-    max_decoding_steps: int = 256
-    fast_skip_tokens: int = 128
-
-    # Whether to validate that decoded action tokens start with "Action: " prefix
-    validate_action_token_prefix: bool = True
-
+    max_decoding_steps: int = 32
     # Whether to use KV cache for faster autoregressive decoding
     use_kv_cache: bool = True
 
@@ -101,13 +93,6 @@ class PI0FastConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
-
-        # Validate configuration
-        if self.n_action_steps > self.chunk_size:
-            raise ValueError(
-                f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
-            )
-
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
 
@@ -130,13 +115,6 @@ class PI0FastConfig(PreTrainedConfig):
                 shape=(self.max_state_dim,),  # Padded to max_state_dim
             )
             self.input_features[OBS_STATE] = state_feature
-
-        if ACTION not in self.output_features:
-            action_feature = PolicyFeature(
-                type=FeatureType.ACTION,
-                shape=(self.max_action_dim,),  # Padded to max_action_dim
-            )
-            self.output_features[ACTION] = action_feature
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -161,7 +139,7 @@ class PI0FastConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        return None
 
     @property
     def reward_delta_indices(self) -> None:

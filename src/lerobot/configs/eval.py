@@ -31,9 +31,11 @@ class EvalPipelineConfig:
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch
     # (useful for debugging). This argument is mutually exclusive with `--config`.
-    env: envs.EnvConfig
+    env: envs.EnvConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
+    repo_id: str | None = None
     policy: PreTrainedConfig | None = None
+    planner: PreTrainedConfig | None = None
     output_dir: Path | None = None
     job_name: str | None = None
     seed: int | None = 1000
@@ -55,6 +57,12 @@ class EvalPipelineConfig:
                 "No pretrained path was provided, evaluated policy will be built from scratch (random weights)."
             )
 
+        planner_path = parser.get_path_arg("planner")
+        if planner_path:
+            cli_overrides = parser.get_cli_overrides("planner")
+            self.planner = PreTrainedConfig.from_pretrained(planner_path, cli_overrides=cli_overrides)
+            self.planner.pretrained_path = Path(planner_path)
+
         if not self.job_name:
             if self.env is None:
                 self.job_name = f"{self.policy.type if self.policy is not None else 'scratch'}"
@@ -73,4 +81,4 @@ class EvalPipelineConfig:
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
-        return ["policy"]
+        return ["policy", "planner"]
