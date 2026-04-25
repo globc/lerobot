@@ -56,6 +56,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        return_uint8: bool = False,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         streaming_encoding: bool = False,
@@ -203,6 +204,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_codec()
+        self._return_uint8 = return_uint8
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
@@ -229,6 +231,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             dynamic_action_chunking=dynamic_action_chunking,
+            return_uint8=self._return_uint8,
         )
 
         # Load actual data
@@ -293,6 +296,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
                 dynamic_action_chunking=self.dynamic_action_chunking,
+                return_uint8=self._return_uint8,
             )
         return self.reader
 
@@ -688,6 +692,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_timestamps = None
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_codec()
+        obj._return_uint8 = False
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
@@ -780,6 +785,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_timestamps = None
         obj.episodes = None
         obj._video_backend = video_backend if video_backend else get_safe_default_codec()
+        obj._return_uint8 = False
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
