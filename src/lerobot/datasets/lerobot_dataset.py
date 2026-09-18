@@ -27,7 +27,7 @@ from huggingface_hub.errors import RevisionNotFoundError
 from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
 
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
-from .dataset_reader import DatasetReader
+from .dataset_reader import DatasetReader, EvalDatasetReader, BottomUpDatasetReader, EvalBottomUpDatasetReader
 from .dataset_writer import DatasetWriter
 from .utils import (
     create_lerobot_dataset_card,
@@ -62,7 +62,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
-        dynamic_action_chunking: bool = False,
+        dynamic_action_chunking: str = "",
+        eval: bool = False,
+        split: int = 0,
+        n_splits: int = 1,
+        reader_chain_close: int = 10,
+        reader_chain_dir: bool = False,
+        bottom_up: bool = False,
+        chunk_size: int = 10, # bottom up chunk size
+        is_planner: bool = False,
+        ilfm: bool = False,
+        train_then: bool = False,
+        sorted_dir: bool = False,
+        is_absolute: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -222,17 +234,76 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = self.meta.revision
 
         # Create reader (hf_dataset loaded below)
-        self.reader = DatasetReader(
-            meta=self.meta,
-            root=self.root,
-            episodes=episodes,
-            tolerance_s=tolerance_s,
-            video_backend=self._video_backend,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            dynamic_action_chunking=dynamic_action_chunking,
-            return_uint8=self._return_uint8,
-        )
+        if eval:
+            if not bottom_up:
+                self.reader = EvalDatasetReader(
+                    meta=self.meta,
+                    root=self.root,
+                    episodes=episodes,
+                    tolerance_s=tolerance_s,
+                    video_backend=self._video_backend,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=image_transforms,
+                    dynamic_action_chunking=dynamic_action_chunking,
+                    return_uint8=self._return_uint8,
+                    split=split,
+                    n_splits=n_splits,
+                    chain_close=reader_chain_close,
+                    chain_dir=reader_chain_dir,
+                )
+            else:
+                self.reader = EvalBottomUpDatasetReader(
+                    meta=self.meta,
+                    root=self.root,
+                    episodes=episodes,
+                    tolerance_s=tolerance_s,
+                    video_backend=self._video_backend,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=image_transforms,
+                    dynamic_action_chunking=dynamic_action_chunking,
+                    return_uint8=self._return_uint8,
+                    split=split,
+                    n_splits=n_splits,
+                    chunk_size=chunk_size,
+                )
+        else:
+            if not bottom_up:
+                self.reader = DatasetReader(
+                    meta=self.meta,
+                    root=self.root,
+                    episodes=episodes,
+                    tolerance_s=tolerance_s,
+                    video_backend=self._video_backend,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=image_transforms,
+                    dynamic_action_chunking=dynamic_action_chunking,
+                    return_uint8=self._return_uint8,
+                    chain_close=reader_chain_close,
+                    chain_dir=reader_chain_dir,
+                    is_planner=is_planner,
+                    ilfm=ilfm,
+                    chunk_size=chunk_size,
+                    train_then=train_then,
+                    sorted_dir=sorted_dir,
+                    is_absolute=is_absolute,
+                )
+            else:
+                self.reader = BottomUpDatasetReader(
+                    meta=self.meta,
+                    root=self.root,
+                    episodes=episodes,
+                    tolerance_s=tolerance_s,
+                    video_backend=self._video_backend,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=image_transforms,
+                    dynamic_action_chunking=dynamic_action_chunking,
+                    return_uint8=self._return_uint8,
+                    chunk_size=chunk_size,
+                    chain_close=reader_chain_close,
+                    chain_dir=reader_chain_dir,
+                    is_planner=is_planner,
+                    sorted_dir=sorted_dir,
+                )
 
         # Load actual data
         if force_cache_sync or not self.reader.try_load():

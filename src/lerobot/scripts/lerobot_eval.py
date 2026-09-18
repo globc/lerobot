@@ -66,6 +66,8 @@ from functools import partial
 from pathlib import Path
 from pprint import pformat
 from typing import Any, TypedDict
+from collections import deque
+import re
 
 import einops
 import gymnasium as gym
@@ -98,6 +100,29 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
+def is_noop(action, prev_action=None, threshold=1e-4):
+    action = action[0] # assert batch_size=1
+    if prev_action is None: # or True
+        # logging.info("Noop skip prefetch")
+        return np.linalg.norm(action[:-1]) < threshold
+
+    prev_action = prev_action[0]
+    gripper_action = round(action[-1].item())
+    prev_gripper_action = round(prev_action[-1].item())
+    return np.linalg.norm(action[:-1]) < threshold and gripper_action == prev_gripper_action
+
+import re
+import logging
+import os
+from collections import deque
+from copy import deepcopy
+import numpy as np
+import torch
+import torch.nn as nn
+from tqdm import trange
+import einops
+
+# (Assuming other required imports like is_noop, ACTION, OBS_STR, preprocess_observation, etc. are handled globally)
 
 def rollout(
     env: gym.vector.VectorEnv,
@@ -112,39 +137,32 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv, Any], None] | None = None,
+    force_policy_steps: int = 0,
 ) -> dict:
-    """Run a batched policy rollout once through a batch of environments.
-
-    Note that all environments in the batch are run until the last environment is done. This means some
-    data will probably need to be discarded (for environments that aren't the first one to be done).
-
-    The return dictionary contains:
-        (optional) "observation": A dictionary of (batch, sequence + 1, *) tensors mapped to observation
-            keys. NOTE that this has an extra sequence element relative to the other keys in the
-            dictionary. This is because an extra observation is included for after the environment is
-            terminated or truncated.
-        "action": A (batch, sequence, action_dim) tensor of actions applied based on the observations (not
-            including the last observations).
-        "reward": A (batch, sequence) tensor of rewards received for applying the actions.
-        "success": A (batch, sequence) tensor of success conditions (the only time this can be True is upon
-            environment termination/truncation).
-        "done": A (batch, sequence) tensor of **cumulative** done conditions. For any given batch element,
-            the first True is followed by True's all the way till the end. This can be used for masking
-            extraneous elements from the sequences above.
-
-    Args:
-        env: The batch of environments.
-        policy: The policy. Must be a PyTorch nn module.
-        seeds: The environments are seeded once at the start of the rollout. If provided, this argument
-            specifies the seeds for each of the environments.
-        return_observations: Whether to include all observations in the returned rollout data. Observations
-            are returned optionally because they typically take more memory to cache. Defaults to False.
-        render_callback: Optional rendering callback to be used after the environments are reset, and after
-            every step.
-    Returns:
-        The dictionary described above.
-    """
+    """Run a batched policy rollout once through a batch of environments."""
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
+
+    # Helper function to enforce directional ordering in subtasks
+    def _reorder_match(match):
+        content = match.group(1)
+        if "|" in content:
+            dirs_part, steps_part = content.split("|", 1)
+            dirs_part = dirs_part.strip()
+            steps_part = " | " + steps_part.strip()
+        else:
+            dirs_part = content.strip()
+            steps_part = ""
+        
+        dirs = [d.strip() for d in dirs_part.split(",")]
+        
+        def get_prio(d):
+            d_lower = d.lower()
+            if "forward" in d_lower or "backward" in d_lower: return 1
+            if "left" in d_lower or "right" in d_lower: return 2
+            if "up" in d_lower or "down" in d_lower: return 3
+            return 4 # Keeps unrelated matches functionally untouched
+            
+        return "(" + ", ".join(sorted(dirs, key=get_prio)) + steps_part + ")"
 
     # Reset the policy and environments.
     policy.reset()
@@ -158,6 +176,16 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    observations_planner = None
+    action_queue = deque(maxlen=policy.config.n_action_steps)
+    subtask_queue = deque(maxlen=2)
+    prev_action = None
+    policy_subtask_end = False
+
+    # Forcing mechanism trackers
+    steps_since_planner = 0
+    current_force_target = 0
+    last_executed_subtask = ""
 
     step = 0
     # Keep track of which environments are done.
@@ -170,117 +198,246 @@ def rollout(
         leave=False,
     )
     check_env_attributes_and_types(env)
-    while not np.all(done) and step < max_steps:
-        # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
-        observation = preprocess_observation(observation)
-        if return_observations:
-            all_observations.append(deepcopy(observation))
+    try:
+        while not np.all(done) and step < max_steps:
+            # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+            observation = preprocess_observation(observation)
+            if return_observations:
+                all_observations.append(deepcopy(observation))
 
-        # Infer "task" from sub-environments (prefer natural language description).
-        # env.call() works with both SyncVectorEnv and AsyncVectorEnv.
-        try:
-            observation["task"] = list(env.call("task_description"))
-        except (AttributeError, NotImplementedError):
+            # Infer "task" from sub-environments (prefer natural language description).
             try:
-                observation["task"] = list(env.call("task"))
+                observation["task"] = list(env.call("task_description"))
             except (AttributeError, NotImplementedError):
-                observation["task"] = [""] * env.num_envs
+                try:
+                    observation["task"] = list(env.call("task"))
+                except (AttributeError, NotImplementedError):
+                    observation["task"] = [""] * env.num_envs
 
-        # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
-        observation = env_preprocessor(observation)
-        
-        if len(policy._action_queue) == 0:
+            # Apply environment-specific preprocessing
+            observation = env_preprocessor(observation)
             if planner is not None:
-                observation_planner = planner_preprocessor(observation)
-                with torch.inference_mode():
-                    subtask = planner.select_action(observation_planner)
+                if planner.name not in ["llarva"]: # ["qwen", "llarva"]:
+                    observations_planner = observation
+                elif observations_planner is None:
+                    observations_planner = deepcopy(observation)
+                    
+                    if planner.name == "llarva" and observations_planner["observation.state"].ndim == 2:
+                        observations_planner["observation.state"] = observations_planner["observation.state"].unsqueeze(1)
+                    
+                    # elif planner.name == "qwen" and observations_planner["observation.images.image"].ndim == 4:
+                    #     observations_planner["observation.images.image"] = observations_planner["observation.images.image"].unsqueeze(1)
                 
-                    subtask = planner_postprocessor(subtask)
-                current_task = subtask
-                logging.info(f"Planner selected task: {current_task}")
-            elif getattr(policy.config, "hierarchical", False):
-                import matplotlib.pyplot as plt
-                from pathlib import Path
+                else:
+                    if planner.name == "llarva":
+                        curr_state = observation["observation.state"]
+                        if curr_state.ndim == 2:
+                            curr_state = curr_state.unsqueeze(1)
+                            
+                        observations_planner["observation.state"] = torch.cat(
+                            (observations_planner["observation.state"], curr_state), dim=1
+                        )
+                        observations_planner["observation.images.image"] = observation["observation.images.image"]
+                        
+                    # elif planner.name == "qwen":
+                    #     curr_image = observation["observation.images.image"]
+                    #     if curr_image.ndim == 4:
+                    #         curr_image = curr_image.unsqueeze(1)
+                            
+                    #     observations_planner["observation.images.image"] = torch.cat(
+                    #         (observations_planner["observation.images.image"], curr_image), dim=1
+                    #     )
+
+            while len(action_queue) == 0:
+                if len(subtask_queue) == 0:
+                    # ---------------------------------------------------------
+                    # Check if we should enforce minimum steps before replanning
+                    # ---------------------------------------------------------
+                    if current_force_target > 0 and steps_since_planner < current_force_target:
+                        # Note: We re-queue the RAW subtask so we still have step numbers if needed internally
+                        subtask_queue.append(last_executed_subtask)
+                        logging.info(f"Forcing policy steps ({steps_since_planner}/{current_force_target}). Requeuing subtask: {last_executed_subtask}")
+                    else:
+                        if planner is not None:
+                            observation_planner = planner_preprocessor(observations_planner)
+                            with torch.inference_mode():
+                                subtask = planner.select_action(observation_planner)
+                                if planner_postprocessor is not None:
+                                    subtask = planner_postprocessor(subtask)
+
+                            subtask = subtask[0] if isinstance(subtask, list) else subtask
+                            
+                            # Apply forcing rules / exceptions
+                            has_then = " THEN " in subtask
+                            match = re.search(r'\|\s*(\d+)', subtask)
+                            
+                            if match:
+                                parsed_steps = int(match.group(1))
+                                chunk_size = getattr(policy.config, "chunk_size", policy.config.n_action_steps)
+                                # Exception 2: if planner specifies steps, use min(planner_steps, chunk_size) regardless of "THEN"
+                                current_force_target = min(parsed_steps, chunk_size) if force_policy_steps != 0 else 0
+                            else:
+                                # Exception 1: if "THEN" is present, no forcing
+                                current_force_target = 0 if has_then else force_policy_steps
+
+                            steps_since_planner = 0
+
+                            if policy.config.train_then:
+                                subtask_queue.append(subtask)
+                            else:
+                                subtasks = subtask.split(" THEN ")
+                                for sub in subtasks:
+                                    subtask_queue.append(sub)
+                            # subtask_queue.append(subtask)
+                            logging.info(f"Planner selected task: {subtask}")
+                            
+                        elif getattr(policy.config, "hierarchical", False):
+                            import matplotlib.pyplot as plt
+                            from pathlib import Path
+                            
+                            img = observation['observation.images.image'][0]
+                            img_wrist = observation['observation.images.image2'][0]
+                            if isinstance(img, torch.Tensor):
+                                img = img.detach().cpu().numpy()
+                                img_wrist = img_wrist.detach().cpu().numpy()
+                            
+                            if img.ndim == 3 and img.shape[0] in (1, 3):
+                                img = np.transpose(img, (1, 2, 0))
+                                img_wrist = np.transpose(img_wrist, (1, 2, 0))
+                            
+                            plt.imsave("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/lerobot/current_observation.png", img)
+                            plt.imsave("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/lerobot/current_observation_wrist.png", img_wrist)
+                            
+                            user_subtask = input(f"\nEnter subtask for task '{observation['task'][0]}': ")
+                            subtask_queue.append(user_subtask)
+                            
+                            steps_since_planner = 0
+                            current_force_target = force_policy_steps
+                        else:
+                            subtask_queue.append(observation["task"][0])
+                            steps_since_planner = 0
+                            current_force_target = force_policy_steps
+
+                # Pop raw subtask first
+                next_raw_subtask = subtask_queue.popleft()
                 
-                img = observation['observation.images.image'][0]
-                if isinstance(img, torch.Tensor):
-                    img = img.detach().cpu().numpy()
+                # Enforce deterministic directional order when chunking strategy dictates
+                # if getattr(policy.config, "dynamic_action_chunking", None) == "subtask_move":
+                #     next_raw_subtask = re.sub(r'\(([^)]+)\)', _reorder_match, next_raw_subtask)
                 
-                # Convert (C, H, W) to (H, W, C)
-                if img.ndim == 3 and img.shape[0] in (1, 3):
-                    img = np.transpose(img, (1, 2, 0))
+                # Store the raw subtask for the forcing logic to use if it needs to requeue
+                last_executed_subtask = next_raw_subtask
                 
-                plt.imsave("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/lerobot/current_observation.png", img)
+                planner_steps = policy.config.n_action_steps
+                # Let planner predict steps for sequence length using raw subtask string
+                match = re.search(r'\|\s*(\d+)', next_raw_subtask)
+                if match:
+                    planner_steps = int(match.group(1))
+
+                # Clean the string for the policy condition: remove " | <digits>"
+                next_clean_subtask = re.sub(r'\s*\|\s*\d+', '', next_raw_subtask)
                 
-                user_subtask = input(f"\nEnter subtask for task '{observation['task'][0]}': ")
-                current_task = [user_subtask] * env.num_envs
-            else:
-                current_task = observation["task"]
+                observation["subtask"] = [next_clean_subtask]
+                current_task = [next_clean_subtask]
+                observation = preprocessor(observation)
+
+                actions = []
+                for _ in range(min(policy.config.n_action_steps, planner_steps)):
+                    with torch.inference_mode():
+                        action = policy.select_action(observation)
+                    _prev_action = actions[-1] if len(actions) > 0 else prev_action
+
+                    if not (policy.config.ilfm and is_noop(action.detach().cpu().numpy(), _prev_action, threshold=1e-10)):
+                        action = postprocessor(action)
+                    else:
+                        logging.info("Skipping action postprocessing due to ILFM noop.")
+                        logging.info(f"Action: {action})")
+
+                    action_transition = {ACTION: action}
+                    action_transition = env_postprocessor(action_transition)
+                    action = action_transition[ACTION]
+
+                    # Convert to CPU / numpy.
+                    action_numpy: np.ndarray = action.to("cpu").numpy()
+                    assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+                    actions.append(action_numpy)
+                
+                if policy.config.dynamic_action_chunking:
+                    consecutive_noops = 0
+                    for i in range(len(actions) - 1, -1, -1):
+                        _prev_action = actions[i - 1] if i > 0 else prev_action
+                        if is_noop(actions[i], _prev_action, threshold=0.01):
+                            consecutive_noops += 1
+                        else:
+                            policy_subtask_end = consecutive_noops > 1
+                            action_queue.extend(actions[:i+1])
+                            break
+                    if len(action_queue) == 0:
+                        policy_subtask_end = True
+                    logging.info(f"Consecutive no-ops at the end of the action sequence: {consecutive_noops}.")
+                    if not policy_subtask_end:
+                        subtask_queue.clear()
+                else:
+                    action_queue.extend(actions)
+
+            action_numpy = action_queue.popleft()
             
-        observation["subtask"] = current_task
+            # Increment tracking steps when action is consumed
+            steps_since_planner += 1
+            
+            prev_action = action_numpy
+            # Apply the next action.
+            observation, reward, terminated, truncated, info = env.step(action_numpy)
+            if render_callback is not None:
+                render_callback(env, current_task)
 
-        observation = preprocessor(observation)
-        with torch.inference_mode():
-            action = policy.select_action(observation)
-        action = postprocessor(action)
-
-        action_transition = {ACTION: action}
-        action_transition = env_postprocessor(action_transition)
-        action = action_transition[ACTION]
-
-        # Convert to CPU / numpy.
-        action_numpy: np.ndarray = action.to("cpu").numpy()
-        assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
-
-        # Apply the next action.
-        observation, reward, terminated, truncated, info = env.step(action_numpy)
-        if render_callback is not None:
-            render_callback(env, current_task)
-
-        # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
-        # available if none of the envs finished.
-        if "final_info" in info:
-            final_info = info["final_info"]
-            if not isinstance(final_info, dict):
-                raise RuntimeError(
-                    "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
-                    "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
+            if "final_info" in info:
+                final_info = info["final_info"]
+                if not isinstance(final_info, dict):
+                    raise RuntimeError(
+                        "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
+                        "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
+                    )
+                successes = final_info["is_success"].tolist()
+            elif "is_success" in info:
+                is_success = info["is_success"]
+                successes = (
+                    is_success.tolist() if hasattr(is_success, "tolist") else [bool(is_success)] * env.num_envs
                 )
-            successes = final_info["is_success"].tolist()
-        elif "is_success" in info:
-            is_success = info["is_success"]
-            successes = (
-                is_success.tolist() if hasattr(is_success, "tolist") else [bool(is_success)] * env.num_envs
+            else:
+                successes = [False] * env.num_envs
+
+            done = terminated | truncated | done
+            if step + 1 == max_steps:
+                done = np.ones_like(done, dtype=bool)
+
+            all_actions.append(torch.from_numpy(action_numpy))
+            all_rewards.append(torch.from_numpy(reward))
+            all_dones.append(torch.from_numpy(done))
+            all_successes.append(torch.tensor(successes))
+
+            step += 1
+            running_success_rate = (
+                einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
             )
-        else:
-            successes = [False] * env.num_envs
-
-        # Keep track of which environments are done so far.
-        # Mark the episode as done if we reach the maximum step limit.
-        # This ensures that the rollout always terminates cleanly at `max_steps`,
-        # and allows logging/saving (e.g., videos) to be triggered consistently.
-        done = terminated | truncated | done
-        if step + 1 == max_steps:
-            done = np.ones_like(done, dtype=bool)
-
-        all_actions.append(torch.from_numpy(action_numpy))
-        all_rewards.append(torch.from_numpy(reward))
-        all_dones.append(torch.from_numpy(done))
-        all_successes.append(torch.tensor(successes))
-
-        step += 1
-        running_success_rate = (
-            einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
+            progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+            progbar.update()
+    except Exception as e:
+        error_msg = (
+            f"Error during rollout at step {step}/{max_steps}.\n"
+            f" -> Seeds: {seeds}\n"
+            f" -> Task(s): {current_task}\n"
+            f" -> Last Subtask: '{last_executed_subtask}'\n"
+            f" -> Exception: {e}"
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
-        progbar.update()
+        logging.error(error_msg)
 
     # Track the final observation.
     if return_observations:
         observation = preprocess_observation(observation)
         all_observations.append(deepcopy(observation))
 
-    # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
     ret = {
         ACTION: torch.stack(all_actions, dim=1),
         "reward": torch.stack(all_rewards, dim=1),
@@ -295,6 +452,11 @@ def rollout(
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
+
+    if hasattr(policy, "track_analysis") and policy.track_analysis:
+        # Append final success state to easily filter good vs bad rollouts offline
+        final_success_array = einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy()
+        policy.analysis_data.setdefault("final_success", []).append(final_success_array)
 
     return ret
 
@@ -314,6 +476,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    force_policy_steps: int = 0,
 ) -> dict:
     """
     Args:
@@ -385,20 +548,37 @@ def eval_policy(
             task_str = str(tasks[i]) if i < len(tasks) else ""
             
             if task_str:
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.4
-                thickness = 1
-                # Wrap text to ~35 characters to fit within a 256px wide frame nicely
-                wrapped_text = textwrap.wrap(task_str, width=35)
-                
-                y0, dy = 15, 15
-                for j, line in enumerate(wrapped_text):
-                    y = y0 + j * dy
-                    # Draw text outline for better contrast over arbitrary backgrounds
-                    cv2.putText(frame, line, (5, y), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
-                    # Draw internal white text
-                    cv2.putText(frame, line, (5, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-            
+                # Check for dynamic action chunking "trace" config 
+                if getattr(policy.config, "dynamic_action_chunking", None) == "trace":
+                    import ast
+                    try:
+                        # Parse trace string (e.g. "[[32, 12], [32, 32], ... [64, 23]]")
+                        points = ast.literal_eval(task_str)
+                        for pt in points:
+                            x, y = int(pt[0]), int(pt[1])
+                            x = round(x / 256 * 360)
+                            y = round(y / 256 * 360)
+                            # Draw inner red circle
+                            cv2.circle(frame, (x, y), radius=3, color=(0, 0, 255), thickness=-1)
+                            # Draw outer black edge for contrast
+                            cv2.circle(frame, (x, y), radius=4, color=(0, 0, 0), thickness=1)
+                    except (ValueError, SyntaxError) as e:
+                        logging.warning(f"Failed to parse trace points: {e}")
+                else:
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.4
+                    thickness = 1
+                    # Wrap text to ~35 characters to fit within a 256px wide frame nicely
+                    wrapped_text = textwrap.wrap(task_str, width=35)
+                    
+                    y0, dy = 15, 15
+                    for j, line in enumerate(wrapped_text):
+                        y = y0 + j * dy
+                        # Draw text outline for better contrast over arbitrary backgrounds
+                        cv2.putText(frame, line, (5, y), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+                        # Draw internal white text
+                        cv2.putText(frame, line, (5, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        
             annotated_frames.append(frame)
 
         if annotated_frames:
@@ -437,6 +617,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            force_policy_steps=force_policy_steps,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -505,6 +686,7 @@ def eval_policy(
         progbar.set_postfix(
             {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
         )
+
 
     # Wait till all video rendering threads are done.
     for thread in threads:
@@ -634,7 +816,12 @@ def eval_main(cfg: EvalPipelineConfig):
             planner.eval()
 
     else:
-        dataset = LeRobotDataset(cfg.repo_id)
+        from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+        from lerobot.datasets.factory import resolve_delta_timestamps
+        ds_meta = LeRobotDatasetMetadata(cfg.repo_id)
+        delta_timestamps = {}
+        delta_timestamps[ACTION] = [i / ds_meta.fps for i in range(1000)]
+        dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps, dynamic_action_chunking=cfg.sub_key, eval=True, split=cfg.split, n_splits=cfg.n_splits, bottom_up=cfg.bottom_up, chunk_size=cfg.bottom_up_chunk_size)
 
         policy = make_policy(
             cfg=cfg.policy,
@@ -661,7 +848,8 @@ def eval_main(cfg: EvalPipelineConfig):
     }
     if cfg.policy.type == "pi05":
         preprocessor_overrides["pi05_prepare_state_tokenizer_processor_step"] = {
-            "hierarchical": policy.config.hierarchical
+            "hierarchical": policy.config.hierarchical,
+            "include_task": policy.config.include_task,
         }
 
     preprocessor, postprocessor = make_pre_post_processors(
@@ -680,6 +868,8 @@ def eval_main(cfg: EvalPipelineConfig):
             pretrained_path=cfg.planner.pretrained_path,
             preprocessor_overrides=preprocessor_overrides,
         )
+        if cfg.planner.type in ["pi0_fast", "openvla", "llarva", "qwen"]:
+            planner_postprocessor = None
 
     if cfg.repo_id is not None:
         with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
@@ -692,6 +882,10 @@ def eval_main(cfg: EvalPipelineConfig):
                 planner_preprocessor=planner_preprocessor if cfg.planner is not None else None,
                 planner_postprocessor=planner_postprocessor if cfg.planner is not None else None,
                 batch_size=cfg.eval.batch_size,
+                start_seed=cfg.seed,
+                split=cfg.split,
+                output_dir=cfg.output_dir,
+                sub_key=cfg.sub_key,
             )
     else:
         # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
@@ -713,6 +907,7 @@ def eval_main(cfg: EvalPipelineConfig):
                 videos_dir=Path(cfg.output_dir) / "videos",
                 start_seed=cfg.seed,
                 max_parallel_tasks=cfg.env.max_parallel_tasks,
+                force_policy_steps=cfg.force_policy_steps,
             )
         # Close all vec envs
         close_envs(envs)
@@ -720,7 +915,6 @@ def eval_main(cfg: EvalPipelineConfig):
     print("Overall Aggregated Metrics:")
     print(info["overall"])
 
-    # Print per-suite stats
     for task_group, task_group_info in info.items():
         print(f"\nAggregated Metrics for {task_group}:")
         print(task_group_info)
@@ -728,6 +922,15 @@ def eval_main(cfg: EvalPipelineConfig):
     # Save info
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
         json.dump(info, f, indent=2)
+
+    # --- ADD THIS BLOCK TO SAVE ANALYSIS TENSORS ---
+    if hasattr(policy, "track_analysis") and policy.track_analysis:
+        analysis_path = Path(cfg.output_dir) / "pi05_analysis_results.pt"
+        try:
+            policy.save_analysis(str(analysis_path))
+            logging.info(f"Successfully saved analysis offline traces to: {analysis_path}")
+        except Exception as e:
+            logging.error(f"Failed to save analysis: {e}")
 
     logging.info("End of eval")
 
@@ -759,6 +962,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    force_policy_steps: int,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -779,6 +983,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        force_policy_steps=force_policy_steps,
     )
 
     per_episode = task_result["per_episode"]
@@ -808,6 +1013,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    force_policy_steps: int,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -835,6 +1041,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        force_policy_steps=force_policy_steps,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -859,6 +1066,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    force_policy_steps: int = 0,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -917,6 +1125,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        force_policy_steps=force_policy_steps,
     )
 
     if max_parallel_tasks <= 1:
@@ -989,141 +1198,734 @@ def eval_policy_all(
         "overall": overall_agg,
     }
 
+def get_info_success(info):
+    if "final_info" in info:
+        final_info = info["final_info"]
+        if not isinstance(final_info, dict):
+            raise RuntimeError(
+                "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
+                "You're likely using an older version of gymnasium (< 1.0). Please upgrade."
+            )
+        successes = final_info["is_success"].tolist()
+    elif "is_success" in info:
+        is_success = info["is_success"]
+        successes = (
+            is_success.tolist() if hasattr(is_success, "tolist") else [bool(is_success)]
+        )
+    else:
+        successes = [False]
+
+    return successes[0]
+
+def get_dir(current_state, goal_state, sorted=False) -> str:
+    delta = goal_state - current_state
+    
+    components = [
+        (abs(delta[0]), "forward" if delta[0] > 0 else "backward"),
+        (abs(delta[1]), "right" if delta[1] > 0 else "left"),
+        (abs(delta[2]), "up" if delta[2] > 0 else "down"),
+    ]
+    
+    primary_mag, _ = max(components, key=lambda x: x[0])
+    
+    if primary_mag == 0:
+        return ""
+        
+    if sorted:
+        components.sort(key=lambda x: x[0], reverse=True)
+        
+    directions = []
+    
+    for mag, dir_name in components:
+        ratio = mag / primary_mag
+        
+        if ratio < 0.25:
+            continue
+        elif ratio < 0.5:
+            directions.append(f"slightly {dir_name}")
+        else:
+            directions.append(dir_name)
+
+    return ', '.join(directions)
+
+import time
+import json
+import torch
+import numpy as np
+from collections import defaultdict, deque
+from pathlib import Path
+
+import time
+import json
+import torch
+import numpy as np
+from collections import defaultdict, deque
+from pathlib import Path
+
 def eval_policy_dataset(
-    dataset: LeRobotDataset,
-    policy: PreTrainedPolicy,
-    preprocessor: PolicyProcessorPipeline,
-    postprocessor: PolicyProcessorPipeline,
-    planner: PreTrainedPolicy | None,
-    planner_preprocessor: PolicyProcessorPipeline | None,
-    planner_postprocessor: PolicyProcessorPipeline | None,
+    dataset,  # LeRobotDataset
+    policy,   # PreTrainedPolicy
+    preprocessor,  # PolicyProcessorPipeline
+    postprocessor, # PolicyProcessorPipeline
+    planner,  # PreTrainedPolicy | None
+    planner_preprocessor,  # PolicyProcessorPipeline | None
+    planner_postprocessor, # PolicyProcessorPipeline | None
     batch_size: int,
-    num_samples: int = 10000,
+    start_seed: int | None = None,
+    output_dir: Path | None = None,
+    split: int | None = None,
+    sub_key: str | None = None,
 ) -> dict:
     start_t = time.time()
     policy.eval()
     policy.reset()
-    
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    dl_iter = cycle(dataloader)
 
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {"sum_rewards": [], "max_rewards": [], "successes": []})
     overall: dict[str, list] = {"sum_rewards": [], "max_rewards": [], "successes": []}
     per_task_infos: list[dict] = []
     
-    if planner is not None:
-        planner.eval()
+    only_first = False
+    if policy.name == "pi05":
+        out_dir_path = Path(output_dir)
+        eval_info_path = out_dir_path / f"eval_info_{split}.json"
+        
+        # Kept location for logic dependencies, retaining only dir_lang as a metric
+        results_per_task = defaultdict(lambda: {"location": [], "dir_lang": []})
+        completed_counts = defaultdict(int)
+        
+        if eval_info_path.exists():
+            with open(eval_info_path, "r") as f:
+                saved_data = json.load(f)
+                for k, v in saved_data.items():
+                    task_idx = int(k) # JSON keys are strings, convert back to int
+                    
+                    # Load the existing file data into our defaultdict base
+                    results_per_task[task_idx]["location"].extend(v.get("location", []))
+                    results_per_task[task_idx]["dir_lang"].extend(v.get("dir_lang", []))
+                    
+                    # Rebuild the completed counts from the loaded data
+                    completed_counts[task_idx] = sum(1 for loc in v.get("location", []) if float(loc) == 0.0)
 
-        for _ in range(num_samples):
-            batch = next(dl_iter)
-            
-            batch_planner = planner_preprocessor(batch)
-            pred_subtask = planner.select_action(batch_planner)
+        dataset.reader.completed_episodes_per_task = completed_counts
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
 
-            print(f"Task: {batch['task'][0]}\nGT Subtask: {batch['subtask'][0]}\nPred Subtask: {pred_subtask[0]}\n\n")
+        from lerobot.envs.configs import LiberoEnv
+        from lerobot.envs.libero import get_libero_dummy_action
+        env_config = LiberoEnv(task="libero_90")
+        envs = make_env(env_config) 
+        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_config, policy_cfg=policy.config)
+        
+        for batch in dataloader:
+            if not batch["eval_sub_start"][0].item():
+                continue
+                
+            location = batch["eval_location"][0].item()
+            if only_first and location != 0.0:
+                continue
+            task_id = batch["libero_id"][0].item()
+            sub_len = batch["eval_sub_len"][0].item()
+            task = batch['task'][0]
+            subtask = batch['eval_subtask'][0]
+            full_subtask = batch['subtask'][0]
+            goal_state = batch["eval_goal_state"][0]
+            init_state = batch["eval_init_state"][0]
+            prev_actions = batch["eval_prev_actions"]
+            gt_dir_lang = batch['eval_move'][0]
 
-            batch["subtask"] = pred_subtask
+            # Action trimming
             gt_actions = batch["action"]
-            batch = preprocessor(batch)
+            gt_actions = gt_actions[:, :sub_len, :]
+
+            done = False
+            success = False
+
+            policy.reset()
+            env = envs["libero_90"][task_id]
+            observation, info = env.reset(seed=[start_seed])
+            env.envs[0]._env.set_init_state(init_state)
+            dummy_action = np.array([get_libero_dummy_action()], dtype=np.float32)
             
-            print(f"Number action steps: {policy.config.n_action_steps}")
-            pred_actions = []
-            for _ in range(policy.config.n_action_steps):
-                pred_action = policy.select_action(batch)
-                pred_action = postprocessor(pred_action)
-                pred_actions.append(pred_action)
+            for _ in range(10):
+                observation, reward, terminated, truncated, info = env.step(dummy_action)
 
-            print(f"Task: {batch['task'][0]}\nGT Actions: {gt_actions}\nPred Actions: {pred_actions}\n")
+            prev_action = None # Noop
 
-    elif policy.name == "pi0_fast":
-        sample_ix = 0
-        
-        while sample_ix < num_samples:
-            batch = next(dl_iter)
-            
-            original_tasks = batch["task"].copy()
+            # Fast-forward through previous actions
+            for action in prev_actions:
+                action_transition = {ACTION: action}
+                action_transition = env_postprocessor(action_transition)
+                action = action_transition[ACTION]
 
-            batch = preprocessor(batch)
-            
-            gt_subtasks = batch["subtask"] if "subtask" in batch else [""] * len(batch["task"])
-            pred_subtasks = policy.select_action(batch)
+                action_numpy: np.ndarray = action.to("cpu").numpy()
+                assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
-            for b in range(batch_size):
-                if sample_ix >= num_samples:
+                observation, reward, terminated, truncated, info = env.step(action_numpy)
+                prev_action = action_numpy
+
+                done = terminated | truncated
+                success = get_info_success(info)
+                if done or success:
                     break
-                task_group = original_tasks[b]
-                gt_subtask = gt_subtasks[b]
-                pred_subtask = pred_subtasks[b]
-                
-                # Calculate success for this specific sample
-                is_success = bool(pred_subtask == gt_subtask)
-                sum_reward = 1.0 if is_success else 0.0
-                max_reward = 1.0 if is_success else 0.0
-                
-                # Accumulate per group and overall
-                group_acc[task_group]["successes"].append(is_success)
-                group_acc[task_group]["sum_rewards"].append(sum_reward)
-                group_acc[task_group]["max_rewards"].append(max_reward)
-                
-                overall["successes"].append(is_success)
-                overall["sum_rewards"].append(sum_reward)
-                overall["max_rewards"].append(max_reward)
-                
-                # Accumulate per episode/sample
-                per_task_infos.append({
-                    "sample_ix": sample_ix,
-                    "task_group": task_group,
-                    "gt_subtask": gt_subtask,
-                    "pred_subtask": pred_subtask,
-                    "success": is_success,
-                    "sum_reward": sum_reward,
-                    "max_reward": max_reward,
-                })
-
-                logging.info(f"Sample {sample_ix+1}/{num_samples}")
-                logging.info(f"Original Task: {task_group}")
-                logging.info(f"GT Subtask:   {gt_subtask}")
-                logging.info(f"Pred Subtask: {pred_subtask}")
-                logging.info(f"Match: {is_success}")
-                logging.info("-" * 40)
-
-                sample_ix += 1
             
-        def _agg_from_list(xs):
-            if not xs: return float("nan")
-            return float(np.nanmean(np.array(xs, dtype=float)))
+            if done or success:
+                continue  
 
-        # Compute per-group aggregates
-        groups_aggregated = {}
-        for group, acc in group_acc.items():
-            groups_aggregated[group] = {
-                "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
-                "avg_max_reward": _agg_from_list(acc["max_rewards"]),
-                "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
-                "n_episodes": len(acc["sum_rewards"]),
-            }
+            action_queue = deque(maxlen=policy.config.n_action_steps)
+            policy_states = []
 
-        # Overall aggregates
-        overall_agg = {
-            "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
-            "avg_max_reward": _agg_from_list(overall["max_rewards"]),
-            "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
-            "n_episodes": len(overall["sum_rewards"]),
-            "eval_s": time.time() - start_t,
-            "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
-        }
+            observation = preprocess_observation(observation)
+            observation = env_preprocessor(observation)
+            
+            start_state = observation['observation.state'][0]
+            dir_langs = []
+
+            # Execute Move
+            step = 0
+            max_steps = 1.25 * sub_len
+            min_steps = 0.75 * sub_len
+
+            while step <= sub_len:
+                # Score Dir Lang computation
+                if sub_key == "subtask_move":
+                    cur_state = observation['observation.state'][0]
+                    current_subtask_str = full_subtask
+                    if step == sub_len:
+                        dir_lang = get_dir(start_state, cur_state, sorted=False)
+                        dir_langs.append(dir_lang)
+                        
+                # Fill action queue via policy
+                while len(action_queue) == 0:
+                    observation["task"] = [task]
+                    observation["subtask"] = [current_subtask_str]
+                    observation = preprocessor(observation)
+
+                    actions = []
+                    for _ in range(policy.config.n_action_steps):
+                        with torch.inference_mode():
+                            action = policy.select_action(observation)
+                        action = postprocessor(action)
+
+                        action_transition = {ACTION: action}
+                        action_transition = env_postprocessor(action_transition)
+                        action = action_transition[ACTION]
+
+                        action_numpy: np.ndarray = action.to("cpu").numpy()
+                        assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+                        actions.append(action_numpy)
+                    
+                    if policy.config.dynamic_action_chunking:
+                        for i in range(len(actions) - 1, -1, -1):
+                            _prev_action = actions[i - 1] if i > 0 else prev_action
+                            if not is_noop(actions[i], _prev_action, threshold=0.01):
+                                action_queue.extend(actions[:i+1])
+                                break
+                    else:
+                        action_queue.extend(actions)
+
+                action_numpy = action_queue.popleft()
+                prev_action = action_numpy
+
+                observation, reward, terminated, truncated, info = env.step(action_numpy)
+                observation = preprocess_observation(observation)
+                observation = env_preprocessor(observation)
+                
+                cur_state = observation['observation.state'][0]
+                policy_states.append(cur_state)
+
+                success = get_info_success(info)
+                if success:
+                    break
+                
+                step += 1   
+
+            # ----------------- SAVE RESULTS ----------------- #
+            results_per_task[task_id]["location"].append(round(location, 2))
+            dir_score = max([score_directions(gt_dir_lang, dir_lang) for dir_lang in dir_langs], default=None)
+            results_per_task[task_id]["dir_lang"].append(round(dir_score, 4) if dir_score is not None else None)
+
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+            with open(eval_info_path, "w") as f:
+                json.dump(dict(results_per_task), f, indent=4)
+
+        close_envs(envs)
+
+# def eval_policy_dataset(
+#     dataset,  # LeRobotDataset
+#     policy,   # PreTrainedPolicy
+#     preprocessor,  # PolicyProcessorPipeline
+#     postprocessor, # PolicyProcessorPipeline
+#     planner,  # PreTrainedPolicy | None
+#     planner_preprocessor,  # PolicyProcessorPipeline | None
+#     planner_postprocessor, # PolicyProcessorPipeline | None
+#     batch_size: int,
+#     start_seed: int | None = None,
+#     output_dir: Path | None = None,
+#     split: int | None = None,
+#     sub_key: str = "",
+# ) -> dict:
+#     start_t = time.time()
+#     policy.eval()
+#     policy.reset()
+
+#     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {"sum_rewards": [], "max_rewards": [], "successes": []})
+#     overall: dict[str, list] = {"sum_rewards": [], "max_rewards": [], "successes": []}
+#     per_task_infos: list[dict] = []
+    
+#     only_first = False
+#     if policy.name == "pi05":
+#         out_dir_path = Path(output_dir)
+#         eval_info_path = out_dir_path / f"eval_info_{split}.json"
         
-        logging.info(f"Subtask Prediction Accuracy: {overall_agg['pc_success']:.2f}%")
+#         # Added 'vlm_reward' to tracking dictionaries
+#         results_per_task = defaultdict(lambda: {"location": [], "nrmse": [], "dir_full": [], "dir_lang": [], "euc_dist": [], "vlm_reward": []})
+#         completed_counts = defaultdict(int)
         
-        return {
-            "per_task": per_task_infos,
-            "per_group": groups_aggregated,
-            "overall": overall_agg,
-        }
+#         if eval_info_path.exists():
+#             with open(eval_info_path, "r") as f:
+#                 saved_data = json.load(f)
+#                 for k, v in saved_data.items():
+#                     task_idx = int(k) # JSON keys are strings, convert back to int
+                    
+#                     # Load the existing file data into our defaultdict base
+#                     results_per_task[task_idx]["location"].extend(v.get("location", []))
+#                     results_per_task[task_idx]["nrmse"].extend(v.get("nrmse", []))
+#                     results_per_task[task_idx]["dir_full"].extend(v.get("dir_full", []))
+#                     results_per_task[task_idx]["dir_lang"].extend(v.get("dir_lang", []))
+#                     results_per_task[task_idx]["euc_dist"].extend(v.get("euc_dist", []))
+#                     results_per_task[task_idx]["vlm_reward"].extend(v.get("vlm_reward", []))
+                    
+#                     # Rebuild the completed counts from the loaded data
+#                     completed_counts[task_idx] = sum(1 for loc in v.get("location", []) if float(loc) == 0.0)
+
+#         dataset.reader.completed_episodes_per_task = completed_counts
+#         dataloader = torch.utils.data.DataLoader(
+#             dataset,
+#             batch_size=batch_size,
+#             shuffle=False,
+#         )
+
+#         from lerobot.envs.configs import LiberoEnv
+#         from lerobot.envs.libero import get_libero_dummy_action
+#         env_config = LiberoEnv(task="libero_90")
+#         envs = make_env(env_config) 
+#         env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_config, policy_cfg=policy.config)
+        
+#         for batch in dataloader:
+#             if not batch["eval_sub_start"][0].item():
+#                 continue
+                
+#             location = batch["eval_location"][0].item()
+#             if only_first and location != 0.0:
+#                 continue
+#             task_id = batch["libero_id"][0].item()
+#             sub_len = batch["eval_sub_len"][0].item()
+#             subtask = batch['eval_subtask'][0]
+#             gt_move = batch['eval_move'][0] if batch.get('eval_move') else None
+#             full_subtask = batch['subtask'][0]
+#             goal_state = batch["eval_goal_state"][0]
+#             init_state = batch["eval_init_state"][0]
+#             prev_actions = batch["eval_prev_actions"]
+            
+#             # Action trimming
+#             gt_actions = batch["action"]
+#             gt_actions = gt_actions[:, :sub_len, :]
+
+#             # Retrieve dynamic moves if active
+#             if sub_key == "move_dynamic":
+#                 num_moves = batch["eval_num_moves"][0].item()
+#                 m_goal_states = batch["eval_goal_states"][0][:num_moves].to(goal_state.device)
+#                 m_sub_lens = batch["eval_sub_lens"][0][:num_moves]
+#                 m_moves_gt = batch["eval_moves_str"][0].split("|||")
+#             else:
+#                 m_goal_states = [goal_state]
+#                 m_sub_lens = [sub_len]
+#                 m_moves_gt = [gt_move]
+#                 num_moves = 1
+
+#             done = False
+#             success = False
+
+#             policy.reset()
+#             env = envs["libero_90"][task_id]
+#             observation, info = env.reset(seed=[start_seed])
+#             env.envs[0]._env.set_init_state(init_state)
+#             dummy_action = np.array([get_libero_dummy_action()], dtype=np.float32)
+            
+#             for _ in range(10):
+#                 observation, reward, terminated, truncated, info = env.step(dummy_action)
+
+#             prev_action = None # Noop
+
+#             # Fast-forward through previous actions
+#             for action in prev_actions:
+#                 action_transition = {ACTION: action}
+#                 action_transition = env_postprocessor(action_transition)
+#                 action = action_transition[ACTION]
+
+#                 action_numpy: np.ndarray = action.to("cpu").numpy()
+#                 assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+#                 observation, reward, terminated, truncated, info = env.step(action_numpy)
+#                 prev_action = action_numpy
+
+#                 done = terminated | truncated
+#                 success = get_info_success(info)
+#                 if done or success:
+#                     break
+            
+#             if done or success:
+#                 continue 
+
+#             action_queue = deque(maxlen=policy.config.n_action_steps)
+#             policy_states = []
+#             trajectory_frames = []
+
+#             observation = preprocess_observation(observation)
+#             observation = env_preprocessor(observation)
+            
+#             # Capture initial frame
+#             if "observation.images.image" in observation:
+#                 trajectory_frames.append(observation["observation.images.image"].detach().cpu())
+            
+#             start_state = observation['observation.state'][0]
+#             dir_full = None
+#             dir_lang = None
+
+#             # ----------------- OUTER LOOP: SEQUENTIAL MOVES ----------------- #
+#             for m_idx in range(num_moves):
+#                 cur_goal_state = m_goal_states[m_idx]
+#                 cur_sub_len = m_sub_lens[m_idx].item() if isinstance(m_sub_lens[m_idx], torch.Tensor) else m_sub_lens[m_idx]
+                
+#                 # CRITICAL: Clear stale actions from the previous move's inference
+#                 action_queue.clear()
+                
+#                 # 1) Generate Dynamic move phrase
+#                 if sub_key == "move_dynamic":
+#                     base_subtask = full_subtask.split(" (")[0]
+#                     cur_gt_move = m_moves_gt[m_idx] if m_idx < len(m_moves_gt) else ""
+                    
+#                     if cur_gt_move and "grasp the object" in cur_gt_move:
+#                         current_subtask_str = f"{base_subtask} ({cur_gt_move})"
+#                     else:
+#                         cur_state = observation['observation.state'][0]
+#                         delta = cur_goal_state[:3] - cur_state[:3]
+                        
+#                         components = [
+#                             (abs(delta[0]), "forward" if delta[0] > 0 else "backward"),
+#                             (abs(delta[1]), "right" if delta[1] > 0 else "left"),
+#                             (abs(delta[2]), "up" if delta[2] > 0 else "down"),
+#                         ]
+                        
+#                         primary_mag = max(comp[0] for comp in components)
+#                         if primary_mag == 0:
+#                             pred_move = ""
+#                         else:
+#                             directions = []
+#                             for mag, dir_str in components:
+#                                 if mag == primary_mag:
+#                                     directions.append(dir_str)
+#                                 else:
+#                                     ratio = mag / primary_mag
+#                                     if ratio >= 0.5:
+#                                         directions.append(dir_str)
+#                                     elif ratio >= 0.25:
+#                                         directions.append(f"slightly {dir_str}")
+                                        
+#                             pred_move = ', '.join(directions)
+                        
+#                         current_subtask_str = f"{base_subtask} ({pred_move})"
+#                 else:
+#                     current_subtask_str = full_subtask
+
+#                 # 2) Execute Move Inner Loop
+#                 step = 0
+#                 max_steps = 1.25 * cur_sub_len
+#                 min_steps = 0.75 * cur_sub_len
+                
+#                 # Patience setup
+#                 best_dist = float('inf')
+#                 patience_counter = 0
+#                 max_patience = 3  # Allowed consecutive steps of divergence
+
+#                 while step < max_steps:
+#                     # Score original Dir Lang computation for standard move
+#                     if sub_key != "move_dynamic" and step == cur_sub_len:
+#                         cur_state = observation['observation.state'][0]
+#                         full_pred_delta = cur_state - start_state
+#                         full_gt_delta = cur_goal_state - start_state
+#                         dir_full = np.dot(full_pred_delta, full_gt_delta) / (np.linalg.norm(full_pred_delta) * np.linalg.norm(full_gt_delta))
+
+#                         dir_lang = None
+#                         if m_moves_gt[0] is not None and "grasp the object" not in m_moves_gt[0]:
+#                             delta = cur_state[:3] - start_state[:3]
+#                             components = [
+#                                 (abs(delta[0]), "forward" if delta[0] > 0 else "backward"),
+#                                 (abs(delta[1]), "right" if delta[1] > 0 else "left"),
+#                                 (abs(delta[2]), "up" if delta[2] > 0 else "down"),
+#                             ]
+
+#                             primary_mag = max(comp[0] for comp in components)
+#                             if primary_mag > 0:
+#                                 directions = []
+#                                 for mag, dir_str in components:
+#                                     if mag == primary_mag:
+#                                         directions.append(dir_str)
+#                                     else:
+#                                         ratio = mag / primary_mag
+#                                         if ratio >= 0.5:
+#                                             directions.append(dir_str)
+#                                         elif ratio >= 0.25:
+#                                             directions.append(f"slightly {dir_str}")
+
+#                                 pred_move_eval = ', '.join(directions)
+#                                 dir_lang = score_directions(m_moves_gt[0], pred_move_eval)
+                                
+#                     # Fill action queue via policy
+#                     while len(action_queue) == 0:
+#                         observation["subtask"] = [current_subtask_str]
+#                         observation = preprocessor(observation)
+
+#                         actions = []
+#                         for _ in range(policy.config.n_action_steps):
+#                             with torch.inference_mode():
+#                                 action = policy.select_action(observation)
+#                             action = postprocessor(action)
+
+#                             action_transition = {ACTION: action}
+#                             action_transition = env_postprocessor(action_transition)
+#                             action = action_transition[ACTION]
+
+#                             action_numpy: np.ndarray = action.to("cpu").numpy()
+#                             assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+#                             actions.append(action_numpy)
+                        
+#                         if policy.config.dynamic_action_chunking:
+#                             for i in range(len(actions) - 1, -1, -1):
+#                                 _prev_action = actions[i - 1] if i > 0 else prev_action
+#                                 if not is_noop(actions[i], _prev_action, threshold=0.01):
+#                                     action_queue.extend(actions[:i+1])
+#                                     break
+#                         else:
+#                             action_queue.extend(actions)
+
+#                     action_numpy = action_queue.popleft()
+#                     prev_action = action_numpy
+
+#                     observation, reward, terminated, truncated, info = env.step(action_numpy)
+#                     observation = preprocess_observation(observation)
+                    
+#                     # Capture subsequent frames for the VLM
+#                     if "observation.images.image" in observation:
+#                         trajectory_frames.append(observation["observation.images.image"].detach().cpu())
+
+#                     observation = env_preprocessor(observation)
+#                     cur_state = observation['observation.state'][0]
+#                     policy_states.append(cur_state)
+
+#                     success = get_info_success(info)
+#                     if success:
+#                         break
+                        
+#                     # Stop if not converging, utilizing the patience window
+#                     if sub_key == "move_dynamic" and step > min_steps:
+#                         curr_dist = torch.norm(cur_state - cur_goal_state).item()
+                        
+#                         # Use a small 1e-4 tolerance to account for physics jitter
+#                         if curr_dist > best_dist + 1e-4:
+#                             patience_counter += 1
+#                             if patience_counter >= max_patience:
+#                                 break  # Loop aborts if distance increases 3 steps in a row
+#                         else:
+#                             patience_counter = 0  # Reset counter if distance stays steady or improves
+#                             best_dist = min(best_dist, curr_dist)
+                        
+#                     step += 1  
+                
+#                 if success:
+#                     break
+
+#             # ----------------- COMPUTE NRMSE & EUC_DIST ----------------- #
+#             states_tensor = torch.stack([
+#                 s.detach() if isinstance(s, torch.Tensor) else torch.tensor(s) 
+#                 for s in policy_states
+#             ]).to(goal_state.device)
+
+#             if success:
+#                 nrmse = 0.0
+#                 euc_dist = 0.0
+#             else:
+#                 mse = torch.mean((states_tensor - goal_state)**2, dim=1)
+#                 rmse = torch.sqrt(mse)
+#                 normalization = torch.clamp(goal_state.max() - goal_state.min(), min=1e-8)
+                
+#                 nrmse_vals = rmse / normalization
+#                 nrmse = torch.min(nrmse_vals).item()
+
+#                 euc_dists = torch.norm(states_tensor[:, :3] - goal_state[:3], dim=1)
+#                 euc_dist = torch.min(euc_dists).item()
+
+#             # ----------------- COMPUTE VLM REWARD (TOPReward) ----------------- #
+#             vlm_reward = None
+#             if success:
+#                 vlm_reward = 0.0
+#             elif planner is not None and len(trajectory_frames) > 0:
+#                 # Concatenate frames: (T, 1, C, H, W) -> (T, C, H, W)
+#                 frames_tensor = torch.cat(trajectory_frames, dim=0)
+                
+#                 max_frames = 15
+#                 if len(frames_tensor) > max_frames:
+#                     indices = torch.linspace(0, len(frames_tensor) - 1, max_frames).long()
+#                     frames_tensor = frames_tensor[indices]
+                
+#                 # Clean the subtask by removing anything from the first opening parenthesis onward
+#                 clean_subtask = full_subtask.split(" (")[0].strip()
+                
+#                 planner_transition = {
+#                     "observation.images.image": frames_tensor.to("cuda"),
+#                     "task": clean_subtask, # Passed as a string so the preprocessor batches it cleanly
+#                     "fps": dataset.meta.fps,
+#                 }
+                
+#                 planner_batch = planner_preprocessor(planner_transition)
+#                 with torch.inference_mode():
+#                     reward_raw = planner.select_action(planner_batch)
+                
+#                 planner_output = planner_postprocessor(reward_raw)
+#                 print(planner_output)
+#                 vlm_reward = planner_output[0]
+
+#             # ----------------- SAVE RESULTS ----------------- #
+#             results_per_task[task_id]["location"].append(round(location, 2))
+#             results_per_task[task_id]["nrmse"].append(round(nrmse, 4))
+#             results_per_task[task_id]["euc_dist"].append(round(euc_dist, 4))
+#             results_per_task[task_id]["vlm_reward"].append(round(vlm_reward, 4) if vlm_reward is not None else None)
+            
+#             if sub_key != "move_dynamic":
+#                 results_per_task[task_id]["dir_full"].append(round(float(dir_full), 4) if dir_full is not None else None)
+#                 results_per_task[task_id]["dir_lang"].append(round(dir_lang, 4) if dir_lang is not None else None)
+#             else:
+#                 results_per_task[task_id]["dir_full"].append(None)
+#                 results_per_task[task_id]["dir_lang"].append(None)
+
+#             out_dir_path.mkdir(parents=True, exist_ok=True)
+#             with open(eval_info_path, "w") as f:
+#                 json.dump(dict(results_per_task), f, indent=4)
+
+#         close_envs(envs)
+
+#     elif planner is not None:
+#         planner.eval()
+
+#         for _ in range(num_samples):
+#             batch = next(dl_iter)
+            
+#             batch_planner = planner_preprocessor(batch)
+#             pred_subtask = planner.select_action(batch_planner)
+
+#             print(f"Task: {batch['task'][0]}\nGT Subtask: {batch['subtask'][0]}\nPred Subtask: {pred_subtask[0]}\n\n")
+
+#             batch["subtask"] = pred_subtask
+#             gt_actions = batch["action"]
+#             batch = preprocessor(batch)
+            
+#             print(f"Number action steps: {policy.config.n_action_steps}")
+#             pred_actions = []
+#             for _ in range(policy.config.n_action_steps):
+#                 pred_action = policy.select_action(batch)
+#                 pred_action = postprocessor(pred_action)
+#                 pred_actions.append(pred_action)
+
+#             print(f"Task: {batch['task'][0]}\nGT Actions: {gt_actions}\nPred Actions: {pred_actions}\n")
+
+#     elif policy.name == "pi0_fast":
+#         sample_ix = 0
+        
+#         while sample_ix < num_samples:
+#             batch = next(dl_iter)
+            
+#             original_tasks = batch["task"].copy()
+
+#             batch = preprocessor(batch)
+            
+#             gt_subtasks = batch["subtask"] if "subtask" in batch else [""] * len(batch["task"])
+#             pred_subtasks = policy.select_action(batch)
+
+#             for b in range(batch_size):
+#                 if sample_ix >= num_samples:
+#                     break
+#                 task_group = original_tasks[b]
+#                 gt_subtask = gt_subtasks[b]
+#                 pred_subtask = pred_subtasks[b]
+                
+#                 # Calculate success for this specific sample
+#                 is_success = bool(pred_subtask == gt_subtask)
+#                 sum_reward = 1.0 if is_success else 0.0
+#                 max_reward = 1.0 if is_success else 0.0
+                
+#                 # Accumulate per group and overall
+#                 group_acc[task_group]["successes"].append(is_success)
+#                 group_acc[task_group]["sum_rewards"].append(sum_reward)
+#                 group_acc[task_group]["max_rewards"].append(max_reward)
+                
+#                 overall["successes"].append(is_success)
+#                 overall["sum_rewards"].append(sum_reward)
+#                 overall["max_rewards"].append(max_reward)
+                
+#                 # Accumulate per episode/sample
+#                 per_task_infos.append({
+#                     "sample_ix": sample_ix,
+#                     "task_group": task_group,
+#                     "gt_subtask": gt_subtask,
+#                     "pred_subtask": pred_subtask,
+#                     "success": is_success,
+#                     "sum_reward": sum_reward,
+#                     "max_reward": max_reward,
+#                 })
+
+#                 logging.info(f"Sample {sample_ix+1}/{num_samples}")
+#                 logging.info(f"Original Task: {task_group}")
+#                 logging.info(f"GT Subtask:   {gt_subtask}")
+#                 logging.info(f"Pred Subtask: {pred_subtask}")
+#                 logging.info(f"Match: {is_success}")
+#                 logging.info("-" * 40)
+
+#                 sample_ix += 1
+            
+#         def _agg_from_list(xs):
+#             if not xs: return float("nan")
+#             return float(np.nanmean(np.array(xs, dtype=float)))
+
+#         # Compute per-group aggregates
+#         groups_aggregated = {}
+#         for group, acc in group_acc.items():
+#             groups_aggregated[group] = {
+#                 "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
+#                 "avg_max_reward": _agg_from_list(acc["max_rewards"]),
+#                 "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
+#                 "n_episodes": len(acc["sum_rewards"]),
+#             }
+
+#         # Overall aggregates
+#         overall_agg = {
+#             "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
+#             "avg_max_reward": _agg_from_list(overall["max_rewards"]),
+#             "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
+#             "n_episodes": len(overall["sum_rewards"]),
+#             "eval_s": time.time() - start_t,
+#             "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
+#         }
+        
+#         logging.info(f"Subtask Prediction Accuracy: {overall_agg['pc_success']:.2f}%")
+        
+#         return {
+#             "per_task": per_task_infos,
+#             "per_group": groups_aggregated,
+#             "overall": overall_agg,
+#         }
 
     # elif policy.name == "pi0_fast":
     #     is_generalize = False
@@ -1188,7 +1990,41 @@ def eval_policy_dataset(
 
     #         print(f"Task: {batch['task'][0]}\nGT Actions: {gt_actions}\nPred Actions: {pred_actions}\n")
 
+import math
 
+def parse_direction(d_str):
+    """Converts a direction string into a 3D vector [X, Y, Z]."""
+    vec = [0.0, 0.0, 0.0] # [Right/Left, Forward/Backward, Up/Down]
+    
+    for part in d_str.split(','):
+        part = part.strip().lower()
+        magnitude = 0.5 if 'slightly' in part else 1.0
+        
+        # X-axis
+        if 'right' in part: vec[0] += magnitude
+        elif 'left' in part: vec[0] -= magnitude
+        # Y-axis
+        if 'forward' in part: vec[1] += magnitude
+        elif 'backward' in part or 'back' in part: vec[1] -= magnitude
+        # Z-axis
+        if 'up' in part: vec[2] += magnitude
+        elif 'down' in part: vec[2] -= magnitude
+            
+    return vec
+
+def score_directions(truth_str, policy_str):
+    """Scores policy against truth using Cosine Similarity (0.0 to 1.0)."""
+    v_truth = parse_direction(truth_str)
+    v_policy = parse_direction(policy_str)
+    
+    dot_product = sum(t * p for t, p in zip(v_truth, v_policy))
+    mag_truth = math.sqrt(sum(t * t for t in v_truth))
+    mag_policy = math.sqrt(sum(p * p for p in v_policy))
+    
+    if mag_truth == 0 or mag_policy == 0:
+        return 0.0 # Handle edge case of empty/zero vectors
+        
+    return dot_product / (mag_truth * mag_policy)
 
 def main():
     init_logging()

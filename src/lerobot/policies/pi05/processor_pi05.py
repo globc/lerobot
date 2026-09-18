@@ -57,6 +57,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     hierarchical: bool = False
+    include_task: bool = False
     task_key: str = "task"
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -65,9 +66,12 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for PI05")
-        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key if not self.hierarchical else "subtask")
+        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        subtasks = None
+        if self.hierarchical:
+            subtasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get("subtask")
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -78,11 +82,21 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         full_prompts = []
-        for i, task in enumerate(tasks):
-            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-            state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            full_prompts.append(full_prompt)
+        if subtasks is not None:
+            for i, (task, subtask) in enumerate(zip(tasks, subtasks)):
+                cleaned_task = task.strip().replace("_", " ").replace("\n", " ")
+                state_str = " ".join(map(str, discretized_states[i]))
+                if self.include_task:
+                    full_prompt = f"Task: {cleaned_task}, Subgoal: {subtask}, State: {state_str};\nAction: "
+                else:
+                    full_prompt = f"Task: {subtask}, State: {state_str};\nAction: "
+                full_prompts.append(full_prompt)
+        else:
+            for i, task in enumerate(tasks):
+                cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+                state_str = " ".join(map(str, discretized_states[i]))
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+                full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
@@ -150,7 +164,8 @@ def make_pi05_pre_post_processors(
         ),
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
-            hierarchical=config.hierarchical),
+            hierarchical=config.hierarchical,
+            include_task=config.include_task),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,

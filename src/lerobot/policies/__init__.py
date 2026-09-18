@@ -32,6 +32,7 @@ from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 from .qwen.configuration_qwen import QwenConfig as QwenConfig
+from .llarva.configuration_llarva import LlarvaConfig as LlarvaConfig
 
 # NOTE: Policy modeling classes (e.g., SACPolicy) are intentionally NOT re-exported here.
 # They have heavy optional dependencies and are loaded lazily via get_policy_class().
@@ -55,6 +56,7 @@ __all__ = [
     "WallXConfig",
     "XVLAConfig",
     "QwenConfig",
+    "LlarvaConfig"
     # Base class
     "PreTrainedPolicy",
     # RTC utilities

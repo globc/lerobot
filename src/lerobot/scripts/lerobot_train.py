@@ -296,7 +296,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         }
         if cfg.policy.type == "pi05":
             processor_kwargs["preprocessor_overrides"]["pi05_prepare_state_tokenizer_processor_step"] = {
-                "hierarchical": policy.config.hierarchical
+                "hierarchical": policy.config.hierarchical,
+                "include_task": policy.config.include_task,
             }
             
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {

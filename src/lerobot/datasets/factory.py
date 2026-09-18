@@ -95,6 +95,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 return_uint8=True,
                 tolerance_s=cfg.tolerance_s,
                 dynamic_action_chunking=cfg.policy.dynamic_action_chunking,
+                bottom_up=cfg.bottom_up,
+                chunk_size=cfg.bottom_up_chunk_size if (cfg.bottom_up and cfg.bottom_up_chunk_size is not None) else cfg.policy.chunk_size,
+                reader_chain_close=cfg.reader_chain_close,
+                reader_chain_dir=cfg.reader_chain_dir,
+                is_planner=cfg.is_planner,
+                ilfm=getattr(cfg.policy, "ilfm", False),
+                train_then=getattr(cfg.policy, "train_then", False),
+                sorted_dir=cfg.sorted_dir,
+                is_absolute=getattr(cfg.policy, "use_relative_actions", False),
             )
         else:
             dataset = StreamingLeRobotDataset(

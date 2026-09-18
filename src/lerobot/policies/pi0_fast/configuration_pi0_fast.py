@@ -36,6 +36,8 @@ class PI0FastConfig(PreTrainedConfig):
     max_action_dim: int = 32
     max_action_tokens: int = 32
     hierarchical: bool = True
+    dynamic_action_chunking: str = "subtask"
+    chunk_size = 200
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
@@ -59,7 +61,7 @@ class PI0FastConfig(PreTrainedConfig):
     text_tokenizer_name: str = "google/paligemma-3b-pt-224"
     action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
     temperature: float = 0.0
-    max_decoding_steps: int = 32
+    max_decoding_steps: int = 64
     # Whether to use KV cache for faster autoregressive decoding
     use_kv_cache: bool = True
 
@@ -139,7 +141,7 @@ class PI0FastConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return None
+        return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

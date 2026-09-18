@@ -932,6 +932,7 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+        self.debug = True
 
         self.reset()
 
@@ -1208,8 +1209,26 @@ class PI05Policy(PreTrainedPolicy):
         return images, img_masks
 
     def prepare_action(self, batch):
-        """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        """Append normalized ILFM time horizon to raw actions, THEN pad to max_action_dim."""
+        raw_actions = batch[ACTION]
+        
+        if "info" in batch and "action_horizon" in batch["info"]: # ILFM
+            # Grab it and move it to the correct device
+            H = batch["info"]["action_horizon"].to(raw_actions.device)
+            if self.debug:
+                print(f"Found ILFM action horizon: {H[0].item()}")
+            # Normalize H to [-1, 1]
+            max_h = self.config.ilfm_max_horizon
+            H_norm = (H / max_h) * 2.0 - 1.0
+            H_norm = torch.clamp(H_norm, min=-1.0, max=1.0)
+            
+            # Expand to match [Batch, Horizon, 1]
+            H_channel = H_norm.view(-1, 1, 1).expand(-1, raw_actions.shape[1], 1)
+            
+            # Concatenate right next to the actual actions
+            raw_actions = torch.cat([raw_actions, H_channel], dim=-1)
+            
+        actions = pad_vector(raw_actions, self.config.max_action_dim)
         return actions
 
     @torch.no_grad()
@@ -1227,6 +1246,10 @@ class PI05Policy(PreTrainedPolicy):
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
+        if self.debug:
+            print(f"Policy input={batch['task'][0]}")
+            self.debug = False
+            
         return self._action_queue.popleft()
 
     @torch.no_grad()
@@ -1243,9 +1266,42 @@ class PI05Policy(PreTrainedPolicy):
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
+        raw_actions = actions[:, :, :original_action_dim]
 
-        return actions
+        if self.config.ilfm:
+            time_channel = actions[:, :, original_action_dim]
+            
+            max_h = self.config.ilfm_max_horizon
+            H_pred_norm = time_channel.mean(dim=-1)
+            H_pred_raw = ((H_pred_norm + 1.0) / 2.0) * max_h
+            
+            H_pred = H_pred_raw.round().int()
+            H_pred = torch.clamp(H_pred, min=1, max=max_h)
+            
+            print(f"H_pred: {H_pred[0].item()}")
+
+            truncate_time = H_pred[0].item()
+            # Transpose to [Batch, Dim, Horizon] for F.interpolate
+            raw_actions_channels_first = raw_actions.transpose(1, 2)
+
+            interpolated = torch.nn.functional.interpolate(
+                raw_actions_channels_first, size=truncate_time, mode='linear', align_corners=True
+            ).transpose(1, 2)
+
+            if truncate_time < self.config.n_action_steps:
+                pad_len = self.config.n_action_steps - truncate_time
+                last_valid_action = interpolated[:, -1:, :]  # Shape: [Batch, 1, Dim]
+                
+                # Construct noop: zeros everywhere except the last dimension
+                noop_action = torch.zeros_like(last_valid_action)
+                noop_action[:, :, -1] = last_valid_action[:, :, -1]
+                
+                noops = noop_action.repeat(1, pad_len, 1)
+                interpolated = torch.cat([interpolated, noops], dim=1)
+
+            return interpolated
+        else:
+            return raw_actions
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
@@ -1261,27 +1317,56 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        actions_is_pad = batch.get("action_is_pad")
+        
+        # Determine whether to apply the mask (requires both the config flag and the tensor)
+        apply_pad_mask = getattr(self.config, "mask_pad", False) and actions_is_pad is not None
 
         # Compute loss (no separate state needed for PI05)
         losses = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        losses = losses[:, :, :original_action_dim] if not self.config.ilfm else losses[:, :, :original_action_dim + 1]
+
+        # Apply padding mask to zero-out loss on padded steps
+        if apply_pad_mask:
+            in_episode_bound = ~actions_is_pad
+            losses = losses * in_episode_bound.unsqueeze(-1)
+            # Calculate valid steps to compute accurate per-dim loss logs
+            valid_steps = in_episode_bound.sum().clamp_min(1)
+            loss_per_dim = (losses.sum(dim=[0, 1]) / valid_steps).detach().cpu().numpy().tolist()
+        else:
+            loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_per_dim,
         }
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            if apply_pad_mask:
+                num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
+                per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            else:
+                per_sample_loss = losses.mean(dim=(1, 2))
+                
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            if apply_pad_mask:
+                num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+                loss = losses.sum() / num_valid
+            else:
+                loss = losses.mean()
+                
             loss_dict["loss"] = loss.item()
+
+            if self.debug:
+                print(f"Policy input={batch['task'][0]}")
+                self.debug = False
+
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:

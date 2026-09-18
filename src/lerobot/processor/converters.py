@@ -168,11 +168,14 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
     task_key = {"task": batch["task"]} if "task" in batch else {}
     subtask_key = {"subtask": batch["subtask"]} if "subtask" in batch else {}
+    move_key = {"move": batch["move"]} if "move" in batch else {}
+    init_state_key = {"init_state": batch["init_state"]} if "init_state" in batch else {}
+    libero_id_key = {"libero_id": batch["libero_id"]} if "libero_id" in batch else {}
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
 
-    return {**pad_keys, **task_key, **subtask_key, **index_key, **task_index_key, **episode_index_key}
+    return {**pad_keys, **task_key, **subtask_key, **move_key, **init_state_key, **libero_id_key, **index_key, **task_index_key, **episode_index_key}
 
 
 def create_transition(

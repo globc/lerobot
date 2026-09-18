@@ -61,7 +61,8 @@ from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
 from .qwen.configuration_qwen import QwenConfig
-
+from .openvla.configuration_openvla import OpenVLAConfig
+from .llarva.configuration_llarva import LlarvaConfig
 
 def _reconnect_relative_absolute_steps(
     preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
@@ -129,6 +130,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "openvla":
+        from .openvla.modeling_openvla import OpenVLAPolicy
+
+        return OpenVLAPolicy
     elif name == "sac":
         from .sac.modeling_sac import SACPolicy
 
@@ -161,6 +166,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .qwen.modeling_qwen import QwenPolicy
 
         return QwenPolicy
+    elif name == "llarva":
+        from .llarva.modeling_llarva import LlarvaPolicy
+
+        return LlarvaPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -215,6 +224,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return WallXConfig(**kwargs)
     elif policy_type == "qwen":
         return QwenConfig(**kwargs)
+    elif policy_type == "openvla":
+        return OpenVLAConfig(**kwargs)
+    elif policy_type == "llarva":
+        return LlarvaConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -441,7 +454,20 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
+    elif isinstance(policy_cfg, OpenVLAConfig):
+        from .openvla.processor_openvla import make_openvla_pre_post_processors
 
+        processors = make_openvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+    elif isinstance(policy_cfg, LlarvaConfig):
+        from .llarva.processor_llarva import make_llarva_pre_post_processors
+
+        processors = make_llarva_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
     else:
         try:
             processors = _make_processors_from_policy_config(
@@ -563,7 +589,7 @@ def make_policy(
         if not kwargs["pretrained_name_or_path"]:
             # This means that there's a bug or we trained a policy from scratch using PEFT.
             # It is more likely that this is a bug so we'll raise an error.
-            raise ValueError(
+            logging.info(
                 "No pretrained model name found in adapter config. Can't instantiate the pre-trained policy on which "
                 "the adapter was trained."
             )

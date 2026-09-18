@@ -158,7 +158,11 @@ class LiberoEnv(gym.Env):
         self.episode_length = episode_length
         # Load once and keep
         self._init_states = (
-            get_task_init_states(task_suite, self.task_id, is_libero_plus=self.is_libero_plus)
+            get_task_init_states(
+                task_suite, 
+                self.task_id, 
+                is_libero_plus=self.is_libero_plus,
+            )
             if self.init_states
             else None
         )
@@ -170,16 +174,42 @@ class LiberoEnv(gym.Env):
         task = task_suite.get_task(task_id)
         self.task = task.name
         self.task_description = task.language
+        print(f"[LIBERO-Pro] Loaded task: {self.task} | description: {self.task_description}")
+        if self.is_libero_plus:
+            _LIBERO_PERTURBATION_TAIL_RE = re.compile(
+                r"(?:\s(?:view|initstate|noise|add|tb|table|light|level)(?:\s\d+)+)+$"
+            )
+            self.task_description = _LIBERO_PERTURBATION_TAIL_RE.sub("", self.task_description).strip()
+            
+        # Override BDDL folder for LIBERO-Pro perturbed environments
+        bddl_folder = task_suite_name if task_suite_name else task.problem_folder
         self._task_bddl_file = os.path.join(
-            get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+            get_libero_path("bddl_files"), bddl_folder, os.path.basename(task.bddl_file)
         )
+        
+        # Safe fallback in case it doesn't exist
+        if not os.path.exists(self._task_bddl_file):
+            print(f"[LIBERO-Pro] WARNING: Perturbed BDDL not found at {self._task_bddl_file}. Falling back.")
+            self._task_bddl_file = os.path.join(
+                get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+            )
+        else:
+            print(f"[LIBERO-Pro] Successfully loaded perturbed BDDL: {self._task_bddl_file}")
         self._env: OffScreenRenderEnv | None = (
             None  # deferred — created on first reset() inside the worker subprocess
         )
 
         default_steps = 500
+        
+        # Determine max steps using prefix matching to support LIBERO-Pro suffixes
+        base_steps = default_steps
+        for suite_prefix, steps in TASK_SUITE_MAX_STEPS.items():
+            if task_suite_name.startswith(suite_prefix):
+                base_steps = steps
+                break
+                
         self._max_episode_steps = (
-            TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
+            base_steps
             if self.episode_length is None
             else self.episode_length
         )
@@ -435,6 +465,7 @@ def create_libero_envs(
     episode_length: int | None = None,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
+    task_suite_override: str | None = None,  # NEW: Add this argument
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
@@ -485,7 +516,7 @@ def create_libero_envs(
             fns = _make_env_fns(
                 suite=suite,
                 episode_length=episode_length,
-                suite_name=suite_name,
+                suite_name=task_suite_override if task_suite_override else suite_name,  # THIS IS THE MAGIC!
                 task_id=tid,
                 n_envs=n_envs,
                 camera_names=camera_names,

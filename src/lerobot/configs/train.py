@@ -83,6 +83,13 @@ class TrainPipelineConfig(HubMixin):
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
 
+    bottom_up: bool = False
+    bottom_up_chunk_size: int | None = None
+    reader_chain_close: int = 10
+    reader_chain_dir: bool = True
+    is_planner: bool = False
+    sorted_dir: bool = False
+
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")

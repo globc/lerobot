@@ -1102,8 +1102,8 @@ class PI0FastPolicy(PreTrainedPolicy):
         return images, img_masks
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> list[str]:
-        """Predict a aubtask given environment observations."""
+    def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> list[str]:
+        """Predict a subtask given environment observations."""
         self.eval()
         images, img_masks = self._preprocess_images(batch)
 
@@ -1111,8 +1111,10 @@ class PI0FastPolicy(PreTrainedPolicy):
         tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        # Get decoding parameters
-        temperature = self.config.temperature
+        temperature = kwargs.get("temperature")
+        if temperature is None:
+            temperature = self.config.temperature
+            
         max_decoding_steps = self.config.max_decoding_steps
 
         # Sample target tokens autoregressively
@@ -1142,7 +1144,8 @@ class PI0FastPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        return self.select_action(batch)
+        # Pass the kwargs to ensure temperature and other config overrides are respected
+        return self.select_action(batch, **kwargs)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training."""

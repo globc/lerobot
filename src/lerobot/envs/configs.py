@@ -332,6 +332,16 @@ class LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     is_libero_plus: bool = False
+
+    is_libero_pro: bool = False
+    evaluation_config_path: str = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/lerobot/LIBERO-PRO/evaluation_config.yaml"
+    use_swap: bool = False
+    use_object: bool = False
+    use_language: bool = False
+    use_task: bool = False
+    use_environment: bool = False
+    task_suite_override: str | None = None  # NEW: Store the perturbed task suite name if applicable
+
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -422,6 +432,78 @@ class LiberoEnv(EnvConfig):
 
         if self.task is None:
             raise ValueError("LiberoEnv requires a task to be specified")
+
+        original_task = self.task
+
+        # --- LIBERO-Pro Perturbation Setup ---
+        if self.is_libero_pro:
+            import os
+            import yaml
+            
+            try:
+                import perturbation
+                from libero.libero import get_libero_path
+                import libero.libero.benchmark as benchmark
+            except ImportError as e:
+                raise ImportError("Could not import LIBERO_PRO. Ensure it is in your PYTHONPATH.") from e
+
+            if self.evaluation_config_path and os.path.exists(self.evaluation_config_path):
+                with open(self.evaluation_config_path, "r", encoding="utf-8") as f:
+                    evaluation_cfg = yaml.safe_load(f)
+            else:
+                evaluation_cfg = {
+                    "perturbation_mapping": {
+                        "use_swap": "swap", "use_object": "object", 
+                        "use_language": "lan", "use_task": "task", "use_environment": "env"
+                    },
+                    "bddl_files_path": get_libero_path("bddl_files"),
+                    "init_file_dir": get_libero_path("init_states") + "/",
+                }
+
+            base_bddl = evaluation_cfg.get("bddl_files_path", get_libero_path("bddl_files"))
+            evaluation_cfg["bddl_files_path"] = os.path.join(base_bddl, original_task)
+            evaluation_cfg["task_suite_name"] = original_task
+
+            # Forcefully determine which perturbation is active from CLI
+            perturb_key = None
+            if getattr(self, "use_swap", False): perturb_key = "use_swap"
+            elif getattr(self, "use_object", False): perturb_key = "use_object"
+            elif getattr(self, "use_language", False): perturb_key = "use_language"
+            elif getattr(self, "use_task", False): perturb_key = "use_task"
+            elif getattr(self, "use_environment", False): perturb_key = "use_environment"
+
+            if perturb_key:
+                evaluation_cfg[perturb_key] = True
+                perturb_suffix = evaluation_cfg.get("perturbation_mapping", {}).get(perturb_key, "")
+                
+                if perturb_suffix:
+                    perturbed_name = f"{original_task}_{perturb_suffix}"
+                    init_file_path = os.path.join(
+                        evaluation_cfg.get("init_file_dir", get_libero_path("init_states") + "/"), 
+                        perturbed_name
+                    )
+
+                    # Trigger LIBERO-Pro generation if the folder doesn't exist yet
+                    if not os.path.exists(init_file_path):
+                        print(f"Generating LIBERO-Pro states for {perturbed_name}...")
+                        perturbation.create_env(configs=evaluation_cfg)
+                    
+                    # Set the task to the new suite name
+                    self.task = perturbed_name
+
+                    # Dynamically register the new suite into LIBERO so it loads natively!
+                    if self.task not in benchmark.get_benchmark_dict():
+                        print(f"Dynamically registering {self.task} into LIBERO...")
+                        try:
+                            # Creating a dynamic benchmark class for the perturbed suite
+                            class ProPerturbedSuite(benchmark.Benchmark):
+                                def __init__(self, task_name=self.task):
+                                    super().__init__(task_name)
+                            benchmark.register_benchmark(self.task)(ProPerturbedSuite)
+                        except Exception as e:
+                            print(f"Warning: Failed to dynamically register {self.task}: {e}")
+        # -------------------------------------
+
         env_cls = _make_vec_env_cls(use_async_envs, n_envs)
         return create_libero_envs(
             task=self.task,
@@ -582,6 +664,7 @@ class VLABenchEnv(EnvConfig):
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     render_resolution: tuple[int, int] = (480, 480)
+    track: str = "/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/VLABench/VLABench/configs/evaluation/tracks/track_1_in_distribution.json"
     robot: str = "franka"
     action_mode: str = "eef"
     features: dict[str, PolicyFeature] = field(
@@ -740,6 +823,19 @@ class LiberoPlusEnv(LiberoEnv):
 
     task: str = "libero_spatial"
     is_libero_plus: bool = True
+
+@EnvConfig.register_subclass("libero_pro")
+@dataclass
+class LiberoProEnv(LiberoEnv):
+
+    task: str = "libero_spatial"
+    is_libero_pro: bool = True
+    use_swap: bool = False
+    use_object: bool = False
+    use_language: bool = False
+    use_task: bool = False
+    use_environment: bool = False
+    task_suite_override: str | None = None
 
 
 @EnvConfig.register_subclass("robotwin")

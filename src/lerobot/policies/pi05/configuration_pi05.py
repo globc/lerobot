@@ -36,7 +36,12 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
     hierarchical: bool = False
-    dynamic_action_chunking: bool = False
+    include_task: bool = False
+    dynamic_action_chunking: str = ""
+    mask_pad: bool = False
+    ilfm: bool = False
+    ilfm_max_horizon: int = 75
+    train_then: bool = False
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -170,7 +175,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        return list(range(self.chunk_size if not self.ilfm else 10000))
 
     @property
     def reward_delta_indices(self) -> None:

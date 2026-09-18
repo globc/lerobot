@@ -176,6 +176,6 @@ def make_pi0_fast_pre_post_processors(
             steps=output_steps,
             name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
             to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
+            to_output=lambda transition: transition[TransitionKey.ACTION],
         ),
     )

@@ -21,23 +21,23 @@ from lerobot.configs.types import FeatureType
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("qwen")
+@PreTrainedConfig.register_subclass("llarva")
 @dataclass
-class QwenConfig(PreTrainedConfig):
-    """Configuration for native Qwen policy integration in LeRobot."""
-    model_name: str = "Qwen/Qwen3-VL-8B-Instruct"
-    gradient_checkpointing: bool = True
-    device: str = "cuda"
-    dtype: str = "bfloat16"
-    dynamic_action_chunking: str = "subtask_move"
+class LlarvaConfig(PreTrainedConfig):
+    """Configuration for native Llarva policy integration in LeRobot."""
+    model_name: str = "globcy/llarva_hf"
     chunk_size: int = 1000
-
+    dtype: str = "bfloat16"
+    gradient_checkpointing: bool = True
+    dynamic_action_chunking: str = "trace"
+    zero_shot: bool = False
+    
     def validate_features(self) -> None:
-        """Validate and set up Qwen input and output features."""
+        """Validate and set up Llarva input and output features."""
         image_features = [key for key, feat in self.input_features.items() if feat.type == FeatureType.VISUAL]
         if not image_features:
             raise ValueError(
-                "Qwen policy requires at least one visual input feature. "
+                "Llarva policy requires at least one visual input feature. "
                 "No features of type FeatureType.VISUAL found in input_features."
             )
 
@@ -60,11 +60,11 @@ class QwenConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
-        return None
+        return [-4, -3, -2, -1, 0]
 
     @property
     def action_delta_indices(self) -> list[int]:
-        return list(range(1000))
+        return None
 
     @property
     def reward_delta_indices(self) -> None:

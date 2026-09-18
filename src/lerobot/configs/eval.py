@@ -34,6 +34,12 @@ class EvalPipelineConfig:
     env: envs.EnvConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     repo_id: str | None = None
+    split: int = 0
+    n_splits: int = 1
+    sub_key: str = "subtask"
+    bottom_up: bool = False
+    bottom_up_chunk_size: int = 10
+    force_policy_steps: int = 0
     policy: PreTrainedConfig | None = None
     planner: PreTrainedConfig | None = None
     output_dir: Path | None = None

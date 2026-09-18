@@ -196,6 +196,19 @@ def load_subtasks(local_dir: Path) -> pandas.DataFrame | None:
         return pd.read_parquet(subtasks_path)
     return None
 
+def load_moves(local_dir: Path) -> pandas.DataFrame | None:
+    """Load moves from moves.parquet if it exists."""
+    moves_path = local_dir / "meta/moves.parquet"
+    if moves_path.exists():
+        return pd.read_parquet(moves_path)
+    return None
+
+def load_init_states(local_dir: Path) -> pandas.DataFrame | None:
+    """Load moves from moves.parquet if it exists."""
+    init_states_path = local_dir / "meta/init_states.parquet"
+    if init_states_path.exists():
+        return pd.read_parquet(init_states_path)
+    return None
 
 def write_episodes(episodes: Dataset, local_dir: Path) -> None:
     """Write episode metadata to a parquet file in the LeRobot v3.0 format.
