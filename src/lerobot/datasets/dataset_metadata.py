@@ -35,6 +35,8 @@ from .io_utils import (
     load_info,
     load_stats,
     load_subtasks,
+    load_moves,
+    load_init_states,
     load_tasks,
     write_info,
     write_json,
@@ -178,6 +180,8 @@ class LeRobotDatasetMetadata:
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks = load_tasks(self.root)
         self.subtasks = load_subtasks(self.root)
+        self.moves = load_moves(self.root)
+        self.init_states = load_init_states(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
 
@@ -636,6 +640,9 @@ class LeRobotDatasetMetadata:
 
         obj.tasks = None
         obj.subtasks = None
+        obj.moves = None
+        obj.init_states = None
+        obj.libero_ids = None
         obj.episodes = None
         obj.stats = None
         obj.info = create_empty_dataset_info(

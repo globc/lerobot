@@ -48,6 +48,13 @@ def process_state(state):
     if len(state) == 8: # LIBERO
         gripper_width = state[-2] - state[-1]
         state = state[:-2].tolist() + ([1.0] if gripper_width < 0.05 else [0.0])
+    elif len(state) == 7: # Franka
+        gripper = 1.0 if state[-1] > 0.2 else 0.0
+        state = state[:-1].tolist() + [gripper]
+    # Check if 'state' is a PyTorch tensor and move it to CPU
+    if hasattr(state, 'cpu'):
+        state = state.cpu().numpy()
+
     state = np.round(state, 4).tolist()
     return state
 
@@ -120,12 +127,21 @@ def make_llarva_pre_post_processors(
 
     input_steps: list[ProcessorStep] = [ 
         RenameObservationsProcessorStep(rename_map={}), 
-        AddBatchDimensionProcessorStep(), 
+        AddBatchDimensionProcessorStep(),
+        NormalizerProcessorStep(
+                    features={**config.input_features, **config.output_features},
+                    norm_map=config.normalization_mapping,
+                    stats=dataset_stats,
+                ),
         LlarvaConversationTemplateStep(input_features=config.input_features),
         DeviceProcessorStep(device=config.device), 
     ] 
 
-    output_steps: list[ProcessorStep] = [ 
+    output_steps: list[ProcessorStep] = [
+        UnnormalizerProcessorStep(
+            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+        ),
+        DeviceProcessorStep(device="cpu"),
     ] 
 
     return ( 

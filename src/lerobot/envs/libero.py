@@ -174,13 +174,12 @@ class LiberoEnv(gym.Env):
         task = task_suite.get_task(task_id)
         self.task = task.name
         self.task_description = task.language
-        print(f"[LIBERO-Pro] Loaded task: {self.task} | description: {self.task_description}")
         if self.is_libero_plus:
             _LIBERO_PERTURBATION_TAIL_RE = re.compile(
                 r"(?:\s(?:view|initstate|noise|add|tb|table|light|level)(?:\s\d+)+)+$"
             )
             self.task_description = _LIBERO_PERTURBATION_TAIL_RE.sub("", self.task_description).strip()
-            
+        print(f"Loaded task: {self.task} | description: {self.task_description}")
         # Override BDDL folder for LIBERO-Pro perturbed environments
         bddl_folder = task_suite_name if task_suite_name else task.problem_folder
         self._task_bddl_file = os.path.join(

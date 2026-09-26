@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from lerobot.configs import NormalizationMode
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -32,6 +33,14 @@ class LlarvaConfig(PreTrainedConfig):
     dynamic_action_chunking: str = "trace"
     zero_shot: bool = False
     
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+    )
+
     def validate_features(self) -> None:
         """Validate and set up Llarva input and output features."""
         image_features = [key for key, feat in self.input_features.items() if feat.type == FeatureType.VISUAL]

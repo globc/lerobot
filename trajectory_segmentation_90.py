@@ -1,4 +1,5 @@
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+import tensorflow as tf
+import tensorflow_datasets as tfds
 import numpy as np
 import matplotlib.pyplot as plt
 import json
@@ -66,9 +67,9 @@ def get_kinematic_segments(state, prominence=0.005, min_length=25, sigma=0.0):
     velocities = np.diff(state[:, :6], axis=0)
     velocities = np.insert(velocities, 0, 0, axis=0)
     
+    # OPTIMIZATION: Vectorized gaussian filter instead of loop
     if sigma > 0:
-        for i in range(velocities.shape[1]):
-            velocities[:, i] = gaussian_filter1d(velocities[:, i], sigma=sigma)
+        velocities = gaussian_filter1d(velocities, sigma=sigma, axis=0)
             
     speeds = np.linalg.norm(velocities, axis=1)
 
@@ -91,9 +92,9 @@ def get_directory_segments(state, sigma=4.0, merge_threshold=10):
     velocities = np.diff(state[:, :3], axis=0)
     velocities = np.insert(velocities, 0, 0, axis=0)
 
+    # OPTIMIZATION: Vectorized gaussian filter instead of loop
     if sigma > 0:
-        for i in range(velocities.shape[1]):
-            velocities[:, i] = gaussian_filter1d(velocities[:, i], sigma=sigma)
+        velocities = gaussian_filter1d(velocities, sigma=sigma, axis=0)
     
     all_crossings = set()
     
@@ -160,7 +161,7 @@ def segment_to_move(segment_state, threshold_scale=1.0):
         (abs(delta[0]), "forward" if delta[0] > 0 else "backward"),
         (abs(delta[1]), "right" if delta[1] > 0 else "left"),
         (abs(delta[2]), "up" if delta[2] > 0 else "down"),
-        (abs(delta[3]) / 10, "turn right" if delta[3] > 0 else "turn left"), # see video
+        (abs(delta[3]) / 10, "turn right" if delta[3] > 0 else "turn left"), 
         (abs(delta[4]) / 10, "rotate clockwise" if delta[4] > 0 else "rotate counter-clockwise"),
         (abs(delta[5]) / 10, "tilt up" if delta[5] > 0 else "tilt down")
     ]
@@ -171,7 +172,7 @@ def segment_to_move(segment_state, threshold_scale=1.0):
     primary_mag, primary_dir = components[0]
     move = []
     
-    if primary_mag < base_threshold * 2 : # a 0.3 action in whole segment
+    if primary_mag < base_threshold * 2 : 
         move.append(f"slightly {primary_dir}")
     elif primary_mag < base_threshold * 3:
         move.append(primary_dir)
@@ -191,12 +192,7 @@ def segment_to_move(segment_state, threshold_scale=1.0):
     return ", ".join(move)
 
 
-# --- NEW CLEANUP & MERGE FUNCTION ---
 def clean_and_merge_segments(boundaries, state, vel_threshold=0.0005):
-    """
-    Iteratively removes segments with near-zero max velocity and merges 
-    adjacent segments that map to effectively identical direction strings.
-    """
     if not boundaries:
         return [], []
         
@@ -208,51 +204,46 @@ def clean_and_merge_segments(boundaries, state, vel_threshold=0.0005):
     while changed:
         changed = False
         
-        # 1) Filter out segments where the maximum velocity in any direction is < vel_threshold
         i = 0
         while i < len(bnds) - 1:
             start = bnds[i]
             end = bnds[i+1]
             seg_state = state[start:end]
             
-            # Compute absolute velocity (diff per step) for x, y, and z axes
             vels = np.abs(np.diff(seg_state[:, :3], axis=0))
             max_vel = np.max(vels) if len(vels) > 0 else 0
             
             if max_vel < vel_threshold:
                 if i > 0:
-                    bnds.pop(i) # Drops boundary, merging into previous segment
+                    bnds.pop(i) 
                     changed = True
                     break
                 elif len(bnds) > 2:
-                    bnds.pop(1) # Drops boundary, merging into next segment
+                    bnds.pop(1) 
                     changed = True
                     break
             i += 1
             
         if changed:
-            continue # Restart loop to re-evaluate properties of new merged segments
+            continue 
             
-        # 2) Merge consecutive segments where string output matches
         strings = [segment_to_directory(state[bnds[k]:bnds[k+1]]) for k in range(len(bnds)-1)]
         i = 0
         while i < len(strings) - 1:
             s1 = strings[i]
             s2 = strings[i+1]
             
-            # Create a comparison string devoid of the 'slightly ' modifier
             s1_base = s1.replace("slightly ", "")
             s2_base = s2.replace("slightly ", "")
             
             if s1 == s2 or s1_base == s2_base:
-                bnds.pop(i+1) # Drops boundary, merging segments (re-eval happens on next pass)
+                bnds.pop(i+1) 
                 changed = True
                 break
             i += 1
             
     final_strings = [segment_to_directory(state[bnds[k]:bnds[k+1]]) for k in range(len(bnds)-1)]
     return bnds[:-1], final_strings
-# ------------------------------------
 
 
 def get_segment_dicts(observation_batch, action_batch, segment_boundaries):
@@ -260,7 +251,7 @@ def get_segment_dicts(observation_batch, action_batch, segment_boundaries):
     move_dict = {}
     for i, seg in enumerate(segment_boundaries):
         seg_end = segment_boundaries[i+1] if i+1 < len(segment_boundaries) else len(observation_batch)
-        if seg > 0 and action_batch[seg-1, -1] == -1 and action_batch[seg, -1] == 1: # open to close
+        if seg > 0 and action_batch[seg-1, -1] == -1 and action_batch[seg, -1] == 1: 
             arr = action_batch[seg:seg_end, -1]
             changes = np.where(np.diff(arr) != 0)[0] + 1
             boundaries = np.concatenate(([0], changes, [len(arr)]))
@@ -280,10 +271,8 @@ def get_segment_dicts(observation_batch, action_batch, segment_boundaries):
 
         subtask_dict[seg] = ""
 
-        # Fetch the sub-boundaries and the zero-crossings for all axes
         move_segments, _ = get_directory_segments(observation_batch[seg:seg_end], sigma=4.0)
         
-        # --- NEW MERGING LOGIC INTEGRATION ---
         final_boundaries, final_strings = clean_and_merge_segments(
             move_segments, 
             observation_batch[seg:seg_end], 
@@ -292,12 +281,10 @@ def get_segment_dicts(observation_batch, action_batch, segment_boundaries):
         
         for mov, string in zip(final_boundaries, final_strings):
             move_dict[seg + mov] = string
-        # -------------------------------------
 
     subtask_dict = {int(k): v for k, v in sorted(subtask_dict.items())}
     move_dict = {int(k): v for k, v in sorted(move_dict.items())}
 
-    # --- POST-PROCESSING: Force the first key in move_dict to be 0 ---
     if move_dict:
         first_key = next(iter(move_dict))
         if first_key != 0:
@@ -310,27 +297,33 @@ def get_segment_dicts(observation_batch, action_batch, segment_boundaries):
 
 
 def main():
-    REPO_NAME = "HuggingFaceVLA/libero"
-    dataset = LeRobotDataset(REPO_NAME)
+    builder = tfds.builder_from_directory("/pfss/mlde/workspaces/mlde_wsp_Rohrbach/users/cb14syta/ecot-lite/data/embodied_features_and_demos_libero/libero_lm_90/1.0.0")
     
-    fast_action_dataset = dataset.hf_dataset.select_columns(["action", "observation.state"]).with_format("numpy")
+    # OPTIMIZATION: Prefetching keeps the CPU fed with data continuously
+    dataset = builder.as_dataset(split='train').prefetch(tf.data.AUTOTUNE)
 
     all_subtask_segments = {}
     all_lengths = []
 
-    for ep_idx, ep in enumerate(dataset.meta.episodes):
-        ep_start = ep["dataset_from_index"]
-        ep_end = ep["dataset_to_index"]
-
-        action_batch = fast_action_dataset[ep_start:ep_end]["action"]
-        observation_batch = fast_action_dataset[ep_start:ep_end]["observation.state"]
+    ep_idx = 0
+    for ep in dataset:
+        # OPTIMIZATION: Batch the entire sequence dataset directly into memory 
+        # instead of looping frame-by-frame with Python list comprehensions.
+        batched_steps = ep["steps"].batch(100000) # Ensure it encompasses max episode length
+        step_data = next(iter(tfds.as_numpy(batched_steps)))
+        
+        action_batch = step_data["action"]
+        observation_batch = step_data["observation"]["state"]
+        print(observation_batch[0])
+        cool = col
+        # Pulls from the batched strings array at index 0 directly
+        task = step_data["language_instruction"][0].decode('utf-8')
         
         gripper_actions = action_batch[:, -1].astype(int)
 
         subtask_segments, _ = get_gripper_segments(gripper_actions)
 
         if len(subtask_segments) < 2:
-            # Params found using search
             subtask_segments, _ = get_kinematic_segments(
                 observation_batch, 
                 prominence=0.0085,
@@ -338,13 +331,12 @@ def main():
                 sigma=4.0
             )
         
-        print(f"Subtask segments for episode {ep_idx} ({ep['tasks'][0]})")
+        print(f"Subtask segments for episode {ep_idx} ({task})")
         subtask_dict, move_dict = get_segment_dicts(observation_batch, action_batch, subtask_segments)
         subtask_lengths = np.diff(np.append(np.array(list(subtask_dict.keys())), len(action_batch))).tolist()
 
-        # Save the task name, count, indices, and lengths to our dictionary
         all_subtask_segments[ep_idx] = {
-            "task": ep["tasks"][0],
+            "task": task,
             "num_segments": len(subtask_dict.keys()),
             "subtask_dict": subtask_dict,
             "move_dict": move_dict,
@@ -354,28 +346,25 @@ def main():
         subtask_segments = list(subtask_dict.keys())
 
         all_lengths.extend(subtask_lengths)
+        ep_idx += 1
 
     # --- Save JSON ---
-    json_output_path = "./subtask_segments_dir_merge_new_minima.json"
+    json_output_path = "./subtask_segments_dir_merge_new_minima_90.json"
     with open(json_output_path, "w") as f:
         json.dump(all_subtask_segments, f, indent=4)
     print(f"Successfully saved all segments, tasks, counts, and lengths to {json_output_path}")
 
     # --- Create and Save Plot ---
     plt.figure(figsize=(10, 6))
-    
-    # Plot histogram with auto-calculated bins based on the data
     plt.hist(all_lengths, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
-    
     plt.title("Distribution of Subtask Segment Lengths", fontsize=14)
     plt.xlabel("Segment Length (Frames)", fontsize=12)
     plt.ylabel("Frequency", fontsize=12)
     plt.grid(axis='y', alpha=0.75)
     
-    # Save the figure to disk
-    plot_output_path = "./subtask_lengths_dir_merge_new.png"
+    plot_output_path = "./subtask_lengths_dir_merge_new_minima_90.png"
     plt.savefig(plot_output_path, bbox_inches='tight')
-    plt.close() # Close to free up memory
+    plt.close() 
     print(f"Successfully saved length distribution plot to {plot_output_path}")
 
 if __name__ == "__main__":

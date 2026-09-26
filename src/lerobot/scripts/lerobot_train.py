@@ -58,7 +58,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-from .lerobot_eval import eval_policy_all
+from .lerobot_eval import eval_policy_all, eval_policy_dataset
 
 
 def update_policy(
@@ -506,37 +506,59 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
             accelerator.wait_for_everyone()
 
-        if cfg.env and is_eval_step:
+        if is_eval_step:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
-                with torch.no_grad(), accelerator.autocast():
-                    eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
-                        policy=accelerator.unwrap_model(policy),
-                        env_preprocessor=env_preprocessor,
-                        env_postprocessor=env_postprocessor,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                        n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                        max_parallel_tasks=cfg.env.max_parallel_tasks,
-                    )
-                # overall metrics (suite-agnostic)
+
+                if cfg.env:
+                    with torch.no_grad(), accelerator.autocast():
+                        eval_info = eval_policy_all(
+                            envs=eval_env,
+                            policy=accelerator.unwrap_model(policy),
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
+                    eval_metrics = {
+                        "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                        "pc_success": AverageMeter("success", ":.1f"),
+                        "eval_s": AverageMeter("eval_s", ":.3f"),
+                    }
+                elif cfg.val_repo:
+                    with torch.no_grad(), accelerator.autocast():
+                        eval_info = eval_policy_dataset(
+                            repo_id=cfg.val_repo,
+                            policy=accelerator.unwrap_model(policy),
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            planner=None,
+                            planner_preprocessor=None,
+                            planner_postprocessor=None,
+                            batch_size=1,
+                            start_seed=cfg.seed,
+                            output_dir=cfg.output_dir / "eval" / f"samples_step_{step_id}",
+                        )
+                    eval_metrics = {
+                        "avg_final_score": AverageMeter("score", ":.3f"),
+                        "avg_direction_score": AverageMeter("dir", ":.3f"),
+                        "avg_subtask_score": AverageMeter("subtask", ":.3f"),
+                        "eval_s": AverageMeter("eval_s", ":.3f"),
+                    }
+
+                # overall metrics (suite/group-agnostic)
                 aggregated = eval_info["overall"]
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                # optional: per-suite / per-group logging
+                for group, info in eval_info["per_group"].items():
+                    logging.info("Group %s aggregated: %s", group, info)
 
-                # meters/tracker
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
                 eval_tracker = MetricsTracker(
                     cfg.batch_size,
                     dataset.num_frames,
@@ -545,15 +567,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     initial_step=step,
                     accelerator=accelerator,
                 )
-                eval_tracker.eval_s = aggregated.pop("eval_s")
-                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
-                eval_tracker.pc_success = aggregated.pop("pc_success")
+                for name in eval_metrics:
+                    setattr(eval_tracker, name, aggregated.pop(name))
+
                 if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    wandb_log_dict = {
+                        **eval_tracker.to_dict(),
+                        **{f"eval_group/{g}/{k}": v
+                            for g, d in eval_info["per_group"].items()
+                            for k, v in d.items() if isinstance(v, (int, float))},
+                    }
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    if cfg.env:  # dataset eval produces no videos
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+            
 
     if is_main_process:
         progbar.close()

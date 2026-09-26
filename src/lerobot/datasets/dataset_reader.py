@@ -742,7 +742,7 @@ class BottomUpDatasetReader(DatasetReader):
             video_backend,
             delta_timestamps,
             image_transforms,
-            dynamic_action_chunking="subtask" if dynamic_action_chunking == "subtask_move" else "", # dynamic_action_chunking="subtask",
+            dynamic_action_chunking="", # "subtask" if dynamic_action_chunking == "subtask_move" else "", # dynamic_action_chunking="subtask",
             return_uint8=return_uint8,
             chain_close=chain_close,
             chain_dir=chain_dir,
@@ -820,11 +820,12 @@ class BottomUpDatasetReader(DatasetReader):
                 move_idx = item["move_index"].item()
                 dir_data = self._meta.moves.iloc[move_idx].name
 
-            if "grasp" in dir_data:
-                item["subtask"] += f" ({dir_data})"
-            else:
-                dir = get_dir(current_state=item['observation.state'], goal_state=self.hf_dataset[sub_end-1]['observation.state'], sorted=self.sorted_dir)
-                item["subtask"] += f" ({dir})"
+            item["subtask"] += f" ({dir_data})"
+            # if "grasp" in dir_data:
+            #     item["subtask"] += f" ({dir_data})"
+            # else:
+            #     dir = get_dir(current_state=item['observation.state'], goal_state=self.hf_dataset[sub_end-1]['observation.state'], sorted=self.sorted_dir)
+            #     item["subtask"] += f" ({dir})"
 
                     
             ep_end = self._meta.episodes[ep_idx]["dataset_to_index"]
@@ -1416,9 +1417,6 @@ class EvalDatasetReader(DatasetReader):
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
-        if self.debug:
-            print("Is correct EvalDatasetReader")
-
         ep_start = self._meta.episodes[ep_idx]["dataset_from_index"]
         item["eval_step"] = item["index"] - ep_start
 
@@ -1434,7 +1432,9 @@ class EvalDatasetReader(DatasetReader):
                 return item
 
         # Grouping keys appropriately
-        if "move" in self.dynamic_action_chunking:
+        if self.dynamic_action_chunking == "trace":
+            dac_key = "segments_rdp"
+        elif "move" in self.dynamic_action_chunking:
             dac_key = "move_index"
         else:
             dac_key = "subtask_index"
@@ -1445,10 +1445,23 @@ class EvalDatasetReader(DatasetReader):
             item["eval_sub_start"] = True
         else:
             current_sub = item[dac_key].item()
-            prev_sub = self.hf_dataset[idx - 1][dac_key] if idx > 0 else current_sub
             
-            current_sub_str = self._meta.moves.iloc[current_sub].name
-            is_sub_start = (current_sub != prev_sub) and ("grasp" not in current_sub_str)   
+            # Safely get previous value (handling tensor .item() if necessary)
+            prev_val = self.hf_dataset[idx - 1][dac_key]
+            prev_sub = prev_val.item() if hasattr(prev_val, "item") else prev_val if idx > 0 else current_sub
+            
+            is_sub_start = (current_sub != prev_sub)
+            
+            # Only filter out "grasp" if we are using string-based moves/subtasks
+            if is_sub_start:
+                if dac_key == "move_index" and self._meta.moves is not None:
+                    current_sub_str = self._meta.moves.iloc[current_sub].name
+                    if "grasp" in current_sub_str:
+                        is_sub_start = False
+                elif dac_key == "subtask_index" and self._meta.subtasks is not None:
+                    current_sub_str = self._meta.subtasks.iloc[current_sub].name
+                    if "grasp" in current_sub_str:
+                        is_sub_start = False
                         
             item["eval_sub_start"] = is_sub_start
 
@@ -1509,6 +1522,11 @@ class EvalDatasetReader(DatasetReader):
         rel_sub_end = self._absolute_to_relative_idx[sub_end-1] if self._absolute_to_relative_idx is not None else sub_end-1
         item["eval_goal_state"] = self.hf_dataset[rel_sub_end]['observation.state']
 
+        # Determine relative start and exclusive end indices for the trace
+        rel_abs_idx = self._absolute_to_relative_idx[abs_idx] if self._absolute_to_relative_idx is not None else abs_idx
+        rel_sub_end_excl = rel_abs_idx + (sub_end - abs_idx)
+        item["eval_trace"] = get_trace(full_trace=self.hf_dataset[rel_abs_idx:rel_sub_end_excl]['2d_gripper'])
+
         if "init_state_index" in self._meta.features and self._meta.init_states is not None:
             init_state_idx = item["init_state_index"].item()
             item["eval_init_state"] = np.array(self._meta.init_states.iloc[init_state_idx].name, dtype=np.float32)
@@ -1517,7 +1535,6 @@ class EvalDatasetReader(DatasetReader):
             item["eval_prev_actions"] = []
         else:
             rel_ep_start = self._absolute_to_relative_idx[ep_start] if self._absolute_to_relative_idx is not None else ep_start
-            rel_abs_idx = self._absolute_to_relative_idx[abs_idx] if self._absolute_to_relative_idx is not None else abs_idx
             item["eval_prev_actions"] = self.hf_dataset[rel_ep_start:rel_abs_idx]["action"]
 
         item["eval_location"] = ((abs_idx - ep_start) / (ep_end - ep_start - 1))

@@ -89,6 +89,7 @@ class TrainPipelineConfig(HubMixin):
     reader_chain_dir: bool = True
     is_planner: bool = False
     sorted_dir: bool = False
+    val_repo: str | None = None
 
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.

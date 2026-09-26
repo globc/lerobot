@@ -90,7 +90,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD, OBS_STATE
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -123,6 +123,24 @@ from tqdm import trange
 import einops
 
 # (Assuming other required imports like is_noop, ACTION, OBS_STR, preprocess_observation, etc. are handled globally)
+
+_STEPS_RE = re.compile(r"\s*\|\s*(\d+)")  # same "| <steps>" convention as rollout()
+_SUBGOAL_RE = re.compile(r"^(.*?)\s*\((.*?)\)$")
+
+
+def _aggregate_dataset_scores(samples: list[dict]) -> dict:
+    def _mean(key):
+        return float(np.nanmean([s[key] for s in samples])) if samples else float("nan")
+
+    return {
+        "avg_final_score": _mean("final_score"),
+        "avg_direction_score": _mean("direction_score"),
+        "avg_subtask_score": _mean("subtask_score"),
+        "pc_subtask_correct": _mean("subtask_score") * 100,  # analogue of pc_success
+        "n_samples": len(samples),  # analogue of n_episodes
+        "n_parse_failures": int(sum(s["parse_failed"] for s in samples)),
+    }
+
 
 def rollout(
     env: gym.vector.VectorEnv,
@@ -874,7 +892,7 @@ def eval_main(cfg: EvalPipelineConfig):
     if cfg.repo_id is not None:
         with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
             info = eval_policy_dataset(
-                dataset=dataset,
+                repo_id=cfg.repo_id,
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
@@ -1263,195 +1281,336 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 def eval_policy_dataset(
-    dataset,  # LeRobotDataset
+    repo_id,  # LeRobotDataset
     policy,   # PreTrainedPolicy
     preprocessor,  # PolicyProcessorPipeline
     postprocessor, # PolicyProcessorPipeline
     planner,  # PreTrainedPolicy | None
     planner_preprocessor,  # PolicyProcessorPipeline | None
     planner_postprocessor, # PolicyProcessorPipeline | None
-    batch_size: int,
+    batch_size: int = 1,
     start_seed: int | None = None,
     output_dir: Path | None = None,
     split: int | None = None,
     sub_key: str | None = None,
 ) -> dict:
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+    from tqdm import tqdm
+
     start_t = time.time()
+    ds_meta = LeRobotDatasetMetadata(repo_id)
+    delta_timestamps = {}
+    delta_timestamps[ACTION] = [i / ds_meta.fps for i in range(1000)]
     policy.eval()
     policy.reset()
+    if policy.name in ["qwen", "openvla", "pi0_fast", "llarva"]:
+        if policy.name == "llarva":
+            delta_timestamps[OBS_STATE] = [i / ds_meta.fps for i in [-4, -3, -2, -1, 0]]
+        dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, dynamic_action_chunking="trace" if policy.name == "llarva" else "subtask_move", eval=True, bottom_up=False)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
 
-    group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {"sum_rewards": [], "max_rewards": [], "successes": []})
-    overall: dict[str, list] = {"sum_rewards": [], "max_rewards": [], "successes": []}
-    per_task_infos: list[dict] = []
-    
-    only_first = False
-    if policy.name == "pi05":
-        out_dir_path = Path(output_dir)
-        eval_info_path = out_dir_path / f"eval_info_{split}.json"
-        
-        # Kept location for logic dependencies, retaining only dir_lang as a metric
-        results_per_task = defaultdict(lambda: {"location": [], "dir_lang": []})
-        completed_counts = defaultdict(int)
-        
-        if eval_info_path.exists():
-            with open(eval_info_path, "r") as f:
-                saved_data = json.load(f)
-                for k, v in saved_data.items():
-                    task_idx = int(k) # JSON keys are strings, convert back to int
-                    
-                    # Load the existing file data into our defaultdict base
-                    results_per_task[task_idx]["location"].extend(v.get("location", []))
-                    results_per_task[task_idx]["dir_lang"].extend(v.get("dir_lang", []))
-                    
-                    # Rebuild the completed counts from the loaded data
-                    completed_counts[task_idx] = sum(1 for loc in v.get("location", []) if float(loc) == 0.0)
-
-        dataset.reader.completed_episodes_per_task = completed_counts
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-        )
-
-        from lerobot.envs.configs import LiberoEnv
-        from lerobot.envs.libero import get_libero_dummy_action
-        env_config = LiberoEnv(task="libero_90")
-        envs = make_env(env_config) 
-        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_config, policy_cfg=policy.config)
-        
-        for batch in dataloader:
+        samples: list[dict] = []
+        for batch in tqdm(dataloader, desc="Evaluating subgoal generation", disable=inside_slurm()):
             if not batch["eval_sub_start"][0].item():
                 continue
+
+            # Read ground truth / metadata before the preprocessor touches the batch.
+            subtask = batch["eval_subtask"][0].split(" THEN ")[0]
+            move = batch["eval_move"][0]
+            task = str(batch["task"][0]) if "task" in batch else ""
+            trace = batch["eval_trace"][0]
+            episode_ix = int(batch["episode_index"][0]) if "episode_index" in batch else -1
+
+            model_input = preprocessor(batch)
+            with torch.inference_mode():
+                gen_subgoal = policy.select_action(model_input)
+            gen_subgoal = gen_subgoal[0] if isinstance(gen_subgoal, list) else gen_subgoal
+
+            if policy.name == "llarva":
+                print("Eval. Generated Subgoal:", gen_subgoal)
                 
-            location = batch["eval_location"][0].item()
-            if only_first and location != 0.0:
-                continue
-            task_id = batch["libero_id"][0].item()
-            sub_len = batch["eval_sub_len"][0].item()
-            task = batch['task'][0]
-            subtask = batch['eval_subtask'][0]
-            full_subtask = batch['subtask'][0]
-            goal_state = batch["eval_goal_state"][0]
-            init_state = batch["eval_init_state"][0]
-            prev_actions = batch["eval_prev_actions"]
-            gt_dir_lang = batch['eval_move'][0]
+                parse_failed = False
+                points_similarity = 0.0
+                
+                try:
+                    # 1. Parse generated string into a Python list of lists
+                    gen_points = json.loads(gen_subgoal)
+                    
+                    gt_points = json.loads(trace)
 
-            # Action trimming
-            gt_actions = batch["action"]
-            gt_actions = gt_actions[:, :sub_len, :]
+                    gen_arr = np.array(gen_points)
+                    gt_arr = np.array(gt_points)
 
-            done = False
-            success = False
+                    # 3. Verify shapes match (e.g., both are 8x2)
+                    if gen_arr.shape == gt_arr.shape and gen_arr.size > 0:
+                        # Calculate Mean Euclidean (L2) distance
+                        distances = np.linalg.norm(gt_arr - gen_arr, axis=1)
+                        mean_dist = np.mean(distances)
+                        
+                        # Convert distance to a similarity score [0, 1]
+                        # Perfect match = 1.0, drops towards 0.0 as distance increases
+                        points_similarity = 1.0 / (1.0 + float(mean_dist))
+                    else:
+                        parse_failed = True
+                        
+                except Exception:
+                    parse_failed = True
+
+                final_score = points_similarity
+
+                samples.append(
+                    {
+                        "task": task,
+                        "episode_index": episode_ix,
+                        "subtask": subtask,
+                        "move": trace,
+                        "gen_subtask": "",                   # Padded so downstream aggregators don't crash
+                        "gen_direction": gen_subgoal,                 # Padded so downstream aggregators don't crash
+                        "direction_score": 0.0,              # Padded so downstream aggregators don't crash
+                        "subtask_score": 0.0,                # Padded so downstream aggregators don't crash
+                        "final_score": final_score,
+                        "parse_failed": parse_failed,
+                    }
+                )
+            else:
+                gen_subgoal = gen_subgoal.split(" THEN ")[0]
+
+                print("Eval. Generated Subgoal:", gen_subgoal)
+
+                parsed = _SUBGOAL_RE.match(gen_subgoal)
+                parse_failed = parsed is None
+                if parse_failed:
+                    gen_subtask, gen_direction = gen_subgoal, None
+                else:
+                    gen_subtask, gen_direction = parsed.groups()
+
+                direction_score = 0.0 if gen_direction is None else float(score_directions(move, gen_direction))
+                subtask_score = 1.0 if subtask == gen_subtask else 0.0
+                final_score = 0.5 * direction_score + 0.5 * subtask_score
+
+                samples.append(
+                    {
+                        "task": task,
+                        "episode_index": episode_ix,
+                        "subtask": subtask,
+                        "move": move,
+                        "gen_subtask": gen_subtask,
+                        "gen_direction": gen_direction,
+                        "direction_score": direction_score,
+                        "subtask_score": subtask_score,
+                        "final_score": final_score,
+                        "parse_failed": parse_failed,
+                    }
+                )
 
             policy.reset()
-            env = envs["libero_90"][task_id]
-            observation, info = env.reset(seed=[start_seed])
-            env.envs[0]._env.set_init_state(init_state)
-            dummy_action = np.array([get_libero_dummy_action()], dtype=np.float32)
+
+        # ---- aggregate exactly like eval_policy_all: per task, per group, overall ----
+        by_group: dict[str, list[dict]] = defaultdict(list)
+        by_task: dict[tuple[str, int], list[dict]] = defaultdict(list)
+        for s in samples:
+            by_group[s["task"]].append(s)
+            by_task[(s["task"], s["episode_index"])].append(s)
+
+        per_task_infos = [
+            {
+                "task_group": tg,
+                "task_id": ep,
+                "metrics": {
+                    **_aggregate_dataset_scores(ss),
+                    "samples": [{k: v for k, v in s.items() if k not in ("task", "episode_index")} for s in ss],
+                },
+            }
+            for (tg, ep), ss in by_task.items()
+        ]
+        groups_aggregated = {g: _aggregate_dataset_scores(ss) for g, ss in by_group.items()}
+
+        eval_s = time.time() - start_t
+        overall_agg = {
+            **_aggregate_dataset_scores(samples),
+            "eval_s": eval_s,
+            "eval_sample_s": eval_s / max(1, len(samples)),
+        }
+
+        return {
+            "per_task": per_task_infos,
+            "per_group": groups_aggregated,
+            "overall": overall_agg,
+        }
+                            
+    else:
+        group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {"sum_rewards": [], "max_rewards": [], "successes": []})
+        overall: dict[str, list] = {"sum_rewards": [], "max_rewards": [], "successes": []}
+        per_task_infos: list[dict] = []
+        
+        only_first = False
+        if policy.name == "pi05":
+            out_dir_path = Path(output_dir)
+            eval_info_path = out_dir_path / f"eval_info_{split}.json"
             
-            for _ in range(10):
-                observation, reward, terminated, truncated, info = env.step(dummy_action)
-
-            prev_action = None # Noop
-
-            # Fast-forward through previous actions
-            for action in prev_actions:
-                action_transition = {ACTION: action}
-                action_transition = env_postprocessor(action_transition)
-                action = action_transition[ACTION]
-
-                action_numpy: np.ndarray = action.to("cpu").numpy()
-                assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
-
-                observation, reward, terminated, truncated, info = env.step(action_numpy)
-                prev_action = action_numpy
-
-                done = terminated | truncated
-                success = get_info_success(info)
-                if done or success:
-                    break
+            # Kept location for logic dependencies, retaining only dir_lang as a metric
+            results_per_task = defaultdict(lambda: {"location": [], "dir_lang": []})
+            completed_counts = defaultdict(int)
             
-            if done or success:
-                continue  
-
-            action_queue = deque(maxlen=policy.config.n_action_steps)
-            policy_states = []
-
-            observation = preprocess_observation(observation)
-            observation = env_preprocessor(observation)
-            
-            start_state = observation['observation.state'][0]
-            dir_langs = []
-
-            # Execute Move
-            step = 0
-            max_steps = 1.25 * sub_len
-            min_steps = 0.75 * sub_len
-
-            while step <= sub_len:
-                # Score Dir Lang computation
-                if sub_key == "subtask_move":
-                    cur_state = observation['observation.state'][0]
-                    current_subtask_str = full_subtask
-                    if step == sub_len:
-                        dir_lang = get_dir(start_state, cur_state, sorted=False)
-                        dir_langs.append(dir_lang)
+            if eval_info_path.exists():
+                with open(eval_info_path, "r") as f:
+                    saved_data = json.load(f)
+                    for k, v in saved_data.items():
+                        task_idx = int(k) # JSON keys are strings, convert back to int
                         
-                # Fill action queue via policy
-                while len(action_queue) == 0:
-                    observation["task"] = [task]
-                    observation["subtask"] = [current_subtask_str]
-                    observation = preprocessor(observation)
+                        # Load the existing file data into our defaultdict base
+                        results_per_task[task_idx]["location"].extend(v.get("location", []))
+                        results_per_task[task_idx]["dir_lang"].extend(v.get("dir_lang", []))
+                        
+                        # Rebuild the completed counts from the loaded data
+                        completed_counts[task_idx] = sum(1 for loc in v.get("location", []) if float(loc) == 0.0)
 
-                    actions = []
-                    for _ in range(policy.config.n_action_steps):
-                        with torch.inference_mode():
-                            action = policy.select_action(observation)
-                        action = postprocessor(action)
+            dataset.reader.completed_episodes_per_task = completed_counts
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+            )
 
-                        action_transition = {ACTION: action}
-                        action_transition = env_postprocessor(action_transition)
-                        action = action_transition[ACTION]
-
-                        action_numpy: np.ndarray = action.to("cpu").numpy()
-                        assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
-                        actions.append(action_numpy)
+            from lerobot.envs.configs import LiberoEnv
+            from lerobot.envs.libero import get_libero_dummy_action
+            env_config = LiberoEnv(task="libero_90")
+            envs = make_env(env_config) 
+            env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_config, policy_cfg=policy.config)
+            
+            for batch in dataloader:
+                if not batch["eval_sub_start"][0].item():
+                    continue
                     
-                    if policy.config.dynamic_action_chunking:
-                        for i in range(len(actions) - 1, -1, -1):
-                            _prev_action = actions[i - 1] if i > 0 else prev_action
-                            if not is_noop(actions[i], _prev_action, threshold=0.01):
-                                action_queue.extend(actions[:i+1])
-                                break
-                    else:
-                        action_queue.extend(actions)
+                location = batch["eval_location"][0].item()
+                if only_first and location != 0.0:
+                    continue
+                task_id = batch["libero_id"][0].item()
+                sub_len = batch["eval_sub_len"][0].item()
+                task = batch['task'][0]
+                subtask = batch['eval_subtask'][0]
+                full_subtask = batch['subtask'][0]
+                goal_state = batch["eval_goal_state"][0]
+                init_state = batch["eval_init_state"][0]
+                prev_actions = batch["eval_prev_actions"]
+                gt_dir_lang = batch['eval_move'][0]
 
-                action_numpy = action_queue.popleft()
-                prev_action = action_numpy
+                # Action trimming
+                gt_actions = batch["action"]
+                gt_actions = gt_actions[:, :sub_len, :]
 
-                observation, reward, terminated, truncated, info = env.step(action_numpy)
+                done = False
+                success = False
+
+                policy.reset()
+                env = envs["libero_90"][task_id]
+                observation, info = env.reset(seed=[start_seed])
+                env.envs[0]._env.set_init_state(init_state)
+                dummy_action = np.array([get_libero_dummy_action()], dtype=np.float32)
+                
+                for _ in range(10):
+                    observation, reward, terminated, truncated, info = env.step(dummy_action)
+
+                prev_action = None # Noop
+
+                # Fast-forward through previous actions
+                for action in prev_actions:
+                    action_transition = {ACTION: action}
+                    action_transition = env_postprocessor(action_transition)
+                    action = action_transition[ACTION]
+
+                    action_numpy: np.ndarray = action.to("cpu").numpy()
+                    assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+                    observation, reward, terminated, truncated, info = env.step(action_numpy)
+                    prev_action = action_numpy
+
+                    done = terminated | truncated
+                    success = get_info_success(info)
+                    if done or success:
+                        break
+                
+                if done or success:
+                    continue  
+
+                action_queue = deque(maxlen=policy.config.n_action_steps)
+                policy_states = []
+
                 observation = preprocess_observation(observation)
                 observation = env_preprocessor(observation)
                 
-                cur_state = observation['observation.state'][0]
-                policy_states.append(cur_state)
+                start_state = observation['observation.state'][0]
+                dir_langs = []
 
-                success = get_info_success(info)
-                if success:
-                    break
-                
-                step += 1   
+                # Execute Move
+                step = 0
+                max_steps = 1.25 * sub_len
+                min_steps = 0.75 * sub_len
 
-            # ----------------- SAVE RESULTS ----------------- #
-            results_per_task[task_id]["location"].append(round(location, 2))
-            dir_score = max([score_directions(gt_dir_lang, dir_lang) for dir_lang in dir_langs], default=None)
-            results_per_task[task_id]["dir_lang"].append(round(dir_score, 4) if dir_score is not None else None)
+                while step <= sub_len:
+                    # Score Dir Lang computation
+                    if sub_key == "subtask_move":
+                        cur_state = observation['observation.state'][0]
+                        current_subtask_str = full_subtask
+                        if step == sub_len:
+                            dir_lang = get_dir(start_state, cur_state, sorted=False)
+                            dir_langs.append(dir_lang)
+                            
+                    # Fill action queue via policy
+                    while len(action_queue) == 0:
+                        observation["task"] = [task]
+                        observation["subtask"] = [current_subtask_str]
+                        observation = preprocessor(observation)
 
-            out_dir_path.mkdir(parents=True, exist_ok=True)
-            with open(eval_info_path, "w") as f:
-                json.dump(dict(results_per_task), f, indent=4)
+                        actions = []
+                        for _ in range(policy.config.n_action_steps):
+                            with torch.inference_mode():
+                                action = policy.select_action(observation)
+                            action = postprocessor(action)
 
-        close_envs(envs)
+                            action_transition = {ACTION: action}
+                            action_transition = env_postprocessor(action_transition)
+                            action = action_transition[ACTION]
+
+                            action_numpy: np.ndarray = action.to("cpu").numpy()
+                            assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+                            actions.append(action_numpy)
+                        
+                        if policy.config.dynamic_action_chunking:
+                            for i in range(len(actions) - 1, -1, -1):
+                                _prev_action = actions[i - 1] if i > 0 else prev_action
+                                if not is_noop(actions[i], _prev_action, threshold=0.01):
+                                    action_queue.extend(actions[:i+1])
+                                    break
+                        else:
+                            action_queue.extend(actions)
+
+                    action_numpy = action_queue.popleft()
+                    prev_action = action_numpy
+
+                    observation, reward, terminated, truncated, info = env.step(action_numpy)
+                    observation = preprocess_observation(observation)
+                    observation = env_preprocessor(observation)
+                    
+                    cur_state = observation['observation.state'][0]
+                    policy_states.append(cur_state)
+
+                    success = get_info_success(info)
+                    if success:
+                        break
+                    
+                    step += 1   
+
+                # ----------------- SAVE RESULTS ----------------- #
+                results_per_task[task_id]["location"].append(round(location, 2))
+                dir_score = max([score_directions(gt_dir_lang, dir_lang) for dir_lang in dir_langs], default=None)
+                results_per_task[task_id]["dir_lang"].append(round(dir_score, 4) if dir_score is not None else None)
+
+                out_dir_path.mkdir(parents=True, exist_ok=True)
+                with open(eval_info_path, "w") as f:
+                    json.dump(dict(results_per_task), f, indent=4)
+
+            close_envs(envs)
 
 # def eval_policy_dataset(
 #     dataset,  # LeRobotDataset
